@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vecdgp"
-version = "0.1.1"
+version = "0.1.2"
 description = "Vecchia-approximated deep Gaussian processes (Sauer, Cooper & Gramacy 2023) in Python"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -20,3 +20,14 @@ include = ["vecdgp*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Promote numpy's numerical warnings to errors. These are exactly the symptom
+# of feeding a symmetric-positive-definite matrix to a general LU routine
+# (det / slogdet / solve), whose behaviour is LAPACK-dependent: MKL warns
+# where OpenBLAS does not, so without this the suite is quiet on one machine
+# and noisy on another. Targeted at the three messages rather than all of
+# RuntimeWarning, so unrelated numba/threading warnings still pass through.
+filterwarnings = [
+    "error:divide by zero encountered:RuntimeWarning",
+    "error:overflow encountered:RuntimeWarning",
+    "error:invalid value encountered:RuntimeWarning",
+]

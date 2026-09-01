@@ -46,7 +46,7 @@ from .vecchia import (
     rand_mvn_vec,
 )
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 __all__ = [
     "fit_one_layer",

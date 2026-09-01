@@ -120,12 +120,13 @@ vecdgp/
   predict.py    averaging over MCMC draws, latent-layer mapping
   fit.py        fit_one_layer / fit_two_layer / fit_three_layer, trim, model objects
   settings.py   deepgp's default priors and proposal windows
-  metrics.py    rmse / crps / score
+  metrics.py    rmse / crps / score, safe_cholesky
+  diagnose.py   `python -m vecdgp.diagnose` environment + numerical self-check
 examples/
   demo_booth.py    the deepgp vignette's 1-D nonstationary example
   demo_scaling.py  timing vs n, fits the exponent
 tests/
-  test_vecdgp.py   28 tests
+  test_vecdgp.py   30 tests
 bench/
   ubench.cpp       C++/OpenMP transliteration of u_entries
   run_bench.py     races numba against it
@@ -134,7 +135,7 @@ bench/
 
 ## Correctness
 
-Run `pytest tests -q` (28 tests, ~30 s). The core idea: **when `m = n − 1` the
+Run `pytest tests -q` (30 tests, ~20 s). The core idea: **when `m = n − 1` the
 Vecchia approximation is exact**, so every approximated quantity must
 reproduce the dense-GP calculation to machine precision.
 
@@ -149,6 +150,8 @@ reproduce the dense-GP calculation to machine precision.
   variances at full `m`, and agree with each other.
 - 30 000 sequential posterior samples reproduce the joint predictive mean and
   covariance.
+- `score` matches `multivariate_normal.logpdf` to 1e-9, and stays finite and
+  warning-free on a covariance whose determinant underflows to zero.
 - End-to-end: the two-layer DGP beats the one-layer GP on RMSE **and** CRPS on
   the vignette's piecewise function; nugget estimation recovers a known noise
   level.
@@ -219,6 +222,12 @@ Anthropic ships in Anaconda, but not under the OpenBLAS in a pip numpy. Both
 `score()` and the test suite now use Cholesky, which is the right
 factorisation for an SPD matrix and cannot reach that code path. Only the
 *log* determinant is ever formed.
+
+**Anything else calling `det`/`slogdet`/`inv` on a covariance.** Don't. Every
+covariance here is SPD, so Cholesky is always the right tool. The test suite
+now promotes numpy's divide-by-zero / overflow / invalid-value warnings to
+errors (see `[tool.pytest.ini_options]`), so a regression fails loudly on
+whichever LAPACK you happen to have rather than warning on only some of them.
 
 **Results differ slightly between machines.** Expected, and small: the MCMC is
 seeded through `numpy.random.Generator`, so it is reproducible for a fixed

@@ -263,9 +263,18 @@ def test_score_is_stable_when_the_determinant_underflows():
     n = 150
     x = rng.random((n, 2))
     S = cov_matrix(x, 1.0, 1.0, 1e-6, 2.5)
-    assert np.linalg.det(S) == 0.0, "this test needs an underflowing determinant"
+
+    # Establish the premise without ever calling np.linalg.det -- that is the
+    # very trap under test, and it is not portable: it returns 0.0 under
+    # OpenBLAS but warns and can return nan under MKL, so `det(S) == 0.0`
+    # would itself be a platform-dependent assertion.
     ev = np.linalg.eigvalsh(S)
-    assert ev.min() > 0, "but the matrix is still positive definite"
+    ldet = np.log(ev).sum()
+    assert ldet < np.log(np.nextafter(0, 1)), (
+        "premise: the determinant must be unrepresentable in float64 "
+        f"(log det = {ldet:.0f}, underflow below {np.log(np.nextafter(0, 1)):.0f})"
+    )
+    assert ev.min() > 0, "premise: but the matrix is still positive definite"
 
     y = rng.standard_normal(n)
     with warnings.catch_warnings():

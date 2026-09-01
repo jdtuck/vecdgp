@@ -132,12 +132,16 @@ def main():
         xb = rng.random((150, 2))
         Sb = cov_matrix(xb, 1.0, 1.0, 1e-6, 2.5)
         yb = rng.standard_normal(150)
-        det = np.linalg.det(Sb)
         s = score(yb, np.zeros(150), Sb)
         ev, Q = np.linalg.eigh(Sb)
         ref = (-np.log(ev).sum() - ((Q.T @ yb) ** 2 / ev).sum()) / 150
-        print(f"         (that covariance has det = {det:.2e}, "
-              f"cond = {ev.max()/ev.min():.2e})")
+        # deliberately NOT np.linalg.det: that is the trap being tested, and
+        # calling it here would emit the very warnings this check exists to
+        # rule out. The log determinant says the same thing, portably.
+        ldet = np.log(ev).sum()
+        print(f"         (that covariance has log det = {ldet:.0f}, i.e. det "
+              f"underflows float64 below {np.log(np.nextafter(0, 1)):.0f}; "
+              f"cond = {ev.max() / ev.min():.2e})")
         ok &= _check("score() vs eigendecomposition (relative)",
                      abs(s - ref) / abs(ref), 1e-5)
 
