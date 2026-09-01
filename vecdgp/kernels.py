@@ -63,7 +63,7 @@ def kernel_from_d2(r, v):
     return (1.0 + s + r / 3.0) * np.exp(-s)
 
 
-@njit(cache=True, inline="always")
+@njit(cache=True)
 def _fill_d2(out, x1, x2, theta, v, sep, lower_only):
     """Fill ``out`` with theta-scaled squared distances.
 
@@ -103,7 +103,7 @@ def _fill_d2(out, x1, x2, theta, v, sep, lower_only):
     return out
 
 
-@njit(cache=True, inline="always")
+@njit(cache=True)
 def _apply_kernel(out, n1, n2, tau2, v, lower_only):
     """Map scaled squared distances in ``out`` to covariances, in place.
 

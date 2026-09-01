@@ -198,6 +198,38 @@ here, as it would not load on this box); caching `U` across the MH steps that
 reject; and more cores, since the row loop is embarrassingly parallel and this
 box had only two.
 
+## Troubleshooting
+
+```bash
+python -m vecdgp.diagnose
+```
+
+prints your numpy/scipy/numba versions and BLAS backend, then runs the core
+exactness identities and reports the actual error magnitudes. Any numerical
+warning is captured and shown rather than swallowed.
+
+**`RuntimeWarning: divide by zero / overflow / invalid value encountered in
+slogdet`** — fixed in 0.1.1. `score()` used the general LU-based
+`np.linalg.slogdet` + `solve` on a matrix that is always symmetric positive
+definite. The determinant of a GP covariance underflows extremely fast (`det`
+of a 50×50 predictive covariance is ~1e-92, and it reaches exactly 0.0 by
+n=150) while the matrix is still perfectly well conditioned, so whether LU
+hits a zero pivot depends on the LAPACK build — it warns under MKL, which
+Anthropic ships in Anaconda, but not under the OpenBLAS in a pip numpy. Both
+`score()` and the test suite now use Cholesky, which is the right
+factorisation for an SPD matrix and cannot reach that code path. Only the
+*log* determinant is ever formed.
+
+**Results differ slightly between machines.** Expected, and small: the MCMC is
+seeded through `numpy.random.Generator`, so it is reproducible for a fixed
+seed *on a fixed BLAS*, but the covariance assembly and Cholesky reorder
+floating-point operations differently across backends. Divergence should be at
+the 1e-12 level per operation. `python -m vecdgp.diagnose` will tell you if it
+is larger than that.
+
+**Very slow.** Check `vecdgp using numba: True` in the diagnostic. Without
+numba every kernel falls back to interpreted loops.
+
 ## Scope
 
 Implemented: one/two/three layers, Matérn ν ∈ {½, 3/2, 5/2} and squared

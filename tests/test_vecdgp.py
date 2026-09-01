@@ -10,8 +10,11 @@ known function.
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pytest
+from scipy.linalg import cho_factor, cho_solve, solve_triangular
 from scipy.stats import multivariate_normal
 
 from vecdgp import (
@@ -28,6 +31,7 @@ from vecdgp import (
     logl_vec,
     rand_mvn_vec,
     rmse,
+    score,
 )
 from vecdgp.vecchia import forward_solve_ut, ut_mult
 
@@ -109,14 +113,27 @@ def test_loglik_exact_when_conditioning_sets_are_full(v):
     assert ll == pytest.approx(exact + 0.5 * 55 * np.log(2 * np.pi), rel=1e-9)
 
 
+def _chol_logdet_and_quad(Sigma, v):
+    """Reference log|Sigma| and v' Sigma^-1 v for an SPD Sigma.
+
+    Cholesky, not ``slogdet``/``solve``: the determinant of a GP covariance
+    underflows hard (~1e-92 for n=50) and a general LU factorisation can trip
+    divide-by-zero / overflow warnings on some LAPACK builds even when the
+    matrix is well conditioned.  Only the log determinant is ever formed.
+    """
+    L = np.linalg.cholesky(Sigma)
+    ldet = 2.0 * np.log(np.diag(L)).sum()
+    a = solve_triangular(L, v, lower=True)
+    return ldet, a @ a
+
+
 def test_profile_loglik_and_tau2_hat():
     x, y, rng = _data(n=50, seed=5)
     ap = create_approx(x, m=49, rng=rng)
     ll, tau2 = logl_vec(y, ap, tau2=1.0, theta=0.3, g=1e-3, v=2.5, outer=True)
     Sigma = cov_matrix(ap.x_ord, 1.0, 0.3, 1e-3, 2.5)
     yo = y[ap.order]
-    quad = yo @ np.linalg.solve(Sigma, yo)
-    _, ldet = np.linalg.slogdet(Sigma)
+    ldet, quad = _chol_logdet_and_quad(Sigma, yo)
     assert tau2 == pytest.approx(quad / 50, rel=1e-9)
     assert ll == pytest.approx(-0.5 * ldet - 25 * np.log(quad), rel=1e-9)
 
@@ -170,9 +187,9 @@ def test_prior_draws_respect_a_prior_mean():
 def _exact_krig(x, y, x_new, tau2, theta, g, v):
     K = cov_matrix(x, 1.0, theta, g, v)
     k = cross_cov(x_new, x, 1.0, theta, v)
-    Ki = np.linalg.inv(K)
-    mu = k @ Ki @ y
-    s2 = tau2 * (1.0 + g - np.einsum("ij,jk,ik->i", k, Ki, k))
+    c = cho_factor(K, lower=True)
+    mu = k @ cho_solve(c, y)
+    s2 = tau2 * (1.0 + g - np.einsum("ij,ij->i", k, cho_solve(c, k.T).T))
     return mu, s2
 
 
@@ -198,9 +215,9 @@ def test_joint_prediction_matches_exact_kriging():
     K = cov_matrix(x, 1.0, 0.5, 1e-4, 2.5)
     k = cross_cov(x_new, x, 1.0, 0.5, 2.5)
     Knew = cov_matrix(x_new, 1.0, 0.5, 1e-4, 2.5)
-    Ki = np.linalg.inv(K)
-    mu = k @ Ki @ y
-    Sig = 1.7 * (Knew - k @ Ki @ k.T)
+    c = cho_factor(K, lower=True)
+    mu = k @ cho_solve(c, y)
+    Sig = 1.7 * (Knew - k @ cho_solve(c, k.T))
     assert np.abs(out["mean"] - mu).max() < 1e-7
     assert np.abs(out["sigma"] - Sig).max() < 1e-7
 
@@ -228,6 +245,51 @@ def test_sequential_posterior_samples_have_the_right_moments():
     joint = krig_vec(y, ap, tau2=1.0, theta=0.3, g=1e-4, v=2.5, sigma=True)
     assert np.abs(samples.mean(axis=0) - joint["mean"]).max() < 0.03
     assert np.abs(np.cov(samples, rowvar=False) - joint["sigma"]).max() < 0.02
+
+
+# ---------------------------------------------------------------------------
+# numerical robustness of the scoring rules
+# ---------------------------------------------------------------------------
+def test_score_is_stable_when_the_determinant_underflows():
+    """A GP covariance has a vanishing determinant long before it is singular.
+
+    ``det`` of a smooth, small-nugget covariance underflows to exactly 0 in
+    float64 while the matrix is still perfectly well conditioned.  ``score``
+    must therefore never form the determinant -- only its log -- and must not
+    route an SPD matrix through a general LU factorisation, which can emit
+    divide-by-zero / overflow / invalid warnings on some LAPACK builds.
+    """
+    rng = np.random.default_rng(77)
+    n = 150
+    x = rng.random((n, 2))
+    S = cov_matrix(x, 1.0, 1.0, 1e-6, 2.5)
+    assert np.linalg.det(S) == 0.0, "this test needs an underflowing determinant"
+    ev = np.linalg.eigvalsh(S)
+    assert ev.min() > 0, "but the matrix is still positive definite"
+
+    y = rng.standard_normal(n)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # any numerical warning fails the test
+        s = score(y, np.zeros(n), S)
+    assert np.isfinite(s)
+
+    # independent cross-check via an eigendecomposition
+    ev, Q = np.linalg.eigh(S)
+    ldet = np.log(ev).sum()
+    quad = ((Q.T @ y) ** 2 / ev).sum()
+    assert s == pytest.approx((-ldet - quad) / n, rel=1e-6)
+
+
+def test_score_matches_the_multivariate_normal_density():
+    rng = np.random.default_rng(78)
+    n = 60
+    x = rng.random((n, 2))
+    S = cov_matrix(x, 1.3, 0.4, 1e-3, 2.5)
+    mu = rng.standard_normal(n)
+    y = rng.standard_normal(n)
+    logpdf = multivariate_normal.logpdf(y, mean=mu, cov=S)
+    expected = (2.0 * logpdf + n * np.log(2 * np.pi)) / n
+    assert score(y, mu, S) == pytest.approx(expected, rel=1e-9)
 
 
 # ---------------------------------------------------------------------------

@@ -34,7 +34,7 @@ from .fit import (
 from .kernels import EXP2, cov_matrix, cross_cov, sq_dist
 from .krig import krig_vec
 from .mcmc import logl_vec
-from .metrics import crps, rmse, score
+from .metrics import crps, rmse, safe_cholesky, score
 from .settings import Settings, default_settings
 from .vecchia import (
     EPS,
@@ -46,7 +46,7 @@ from .vecchia import (
     rand_mvn_vec,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
     "fit_one_layer",
@@ -69,6 +69,7 @@ __all__ = [
     "rmse",
     "crps",
     "score",
+    "safe_cholesky",
     "Settings",
     "default_settings",
     "EPS",

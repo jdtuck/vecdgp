@@ -80,7 +80,7 @@ __all__ = [
 # ---------------------------------------------------------------------------
 # small dense linear algebra, jit-friendly and exception-free
 # ---------------------------------------------------------------------------
-@njit(cache=True, inline="always")
+@njit(cache=True)
 def _chol_lower(A, n):
     """In-place lower Cholesky. Returns 0 on success, 1 if not PD."""
     for j in range(n):
