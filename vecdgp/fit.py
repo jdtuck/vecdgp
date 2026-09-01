@@ -116,6 +116,40 @@ class GPVec(_BaseFit):
                                    order_new=order_new,
                                    return_all=return_all, rng=rng)
 
+    def post_sample(self, x_new, nper=1, m=None, order_new=None, rng=None):
+        """Draw joint posterior sample paths at ``x_new``.
+
+        Unlike ``predict``, which returns summarised moments, this returns
+        actual function draws: each row is a realisation of the response
+        surface, correlated across ``x_new``.  Use them for anything that is
+        a *functional* of the surface rather than a pointwise summary -- the
+        distribution of the argmax, threshold-crossing probabilities,
+        propagating surrogate uncertainty downstream, or simply plotting what
+        the posterior believes.
+
+        Sampling is sequential over test locations (Sauer, Cooper & Gramacy
+        2023, Sec. 3.4): each location conditions on the training data *and*
+        on the locations already drawn in that path, so the correlation
+        structure is respected without ever forming a dense ``n_new x n_new``
+        covariance.
+
+        Parameters
+        ----------
+        nper : int
+            Draws per MCMC iteration; the result has ``nper * nmcmc`` rows.
+            One per iteration (the default) already propagates full parameter
+            uncertainty -- raise it only to smooth Monte Carlo noise in a
+            functional.
+        m : int, optional
+            Conditioning-set size, default ``min(n + n_new - 1, 2 * m_fit)``.
+
+        Returns
+        -------
+        ndarray, shape ``(nper * nmcmc, len(x_new))``
+        """
+        return predict_shallow_vec(self, x_new, m=m, order_new=order_new,
+                                   rng=rng, samples_only=True, nper=nper)
+
 
 @dataclass
 class DGP2Vec(_BaseFit):
@@ -146,6 +180,23 @@ class DGP2Vec(_BaseFit):
         return predict_deep_vec(self, x_new, m=m, lite=lite, mean_map=mean_map,
                                 store_latent=store_latent, order_new=order_new,
                                 return_all=return_all, layers=2, rng=rng)
+
+    def post_sample(self, x_new, nper=1, m=None, mean_map=True,
+                    order_new=None, rng=None):
+        """Draw joint posterior sample paths at ``x_new``.
+
+        See :meth:`GPVec.post_sample`.  ``mean_map=False`` additionally
+        propagates a random draw of the latent layer rather than its
+        conditional mean, giving wider and more honest paths at the cost of
+        speed.
+
+        Returns
+        -------
+        ndarray, shape ``(nper * nmcmc, len(x_new))``
+        """
+        return predict_deep_vec(self, x_new, m=m, mean_map=mean_map,
+                                order_new=order_new, rng=rng, layers=2,
+                                samples_only=True, nper=nper)
 
 
 @dataclass
@@ -182,6 +233,23 @@ class DGP3Vec(_BaseFit):
         return predict_deep_vec(self, x_new, m=m, lite=lite, mean_map=mean_map,
                                 store_latent=store_latent, order_new=order_new,
                                 return_all=return_all, layers=3, rng=rng)
+
+    def post_sample(self, x_new, nper=1, m=None, mean_map=True,
+                    order_new=None, rng=None):
+        """Draw joint posterior sample paths at ``x_new``.
+
+        See :meth:`GPVec.post_sample`.  ``mean_map=False`` additionally
+        propagates a random draw of the latent layer rather than its
+        conditional mean, giving wider and more honest paths at the cost of
+        speed.
+
+        Returns
+        -------
+        ndarray, shape ``(nper * nmcmc, len(x_new))``
+        """
+        return predict_deep_vec(self, x_new, m=m, mean_map=mean_map,
+                                order_new=order_new, rng=rng, layers=3,
+                                samples_only=True, nper=nper)
 
 
 # ---------------------------------------------------------------------------

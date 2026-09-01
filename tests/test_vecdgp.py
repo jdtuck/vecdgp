@@ -320,6 +320,82 @@ def booth_data():
     return x, (y - mu) / sd, xp, (_booth(xp) - mu) / sd
 
 
+# ---------------------------------------------------------------------------
+# posterior sample paths
+# ---------------------------------------------------------------------------
+def test_post_sample_moments_match_predict(booth_data):
+    """Law of total variance: the paths must reproduce predict(lite=False).
+
+    A path is drawn from N(mu^(t), Sigma^(t)) for each MCMC draw t, so across
+    all paths the empirical covariance estimates E[Sigma^(t)] + Cov(mu^(t)) --
+    which is exactly what predict assembles analytically.
+    """
+    x, y, xp, _ = booth_data
+    xp = xp[::3]
+    fit = fit_two_layer(x, y, nmcmc=1000, true_g=1e-6, verb=False, seed=1,
+                        m=10).trim(500, 2)
+    paths = fit.post_sample(xp, nper=25, rng=np.random.default_rng(7))
+    pred = fit.predict(xp, lite=False, rng=np.random.default_rng(8))
+
+    assert paths.shape == (25 * fit.nmcmc, len(xp))
+    sd = np.sqrt(np.diag(pred.Sigma))
+    assert np.abs(paths.mean(axis=0) - pred.mean).max() < 0.25 * sd.mean()
+    emp = np.cov(paths, rowvar=False)
+    assert np.abs(np.sqrt(np.diag(emp)) - sd).max() < 0.25 * sd.mean()
+    # the whole point is the off-diagonal structure, not just the margins
+    iu = np.triu_indices(len(xp), 1)
+    assert np.corrcoef(emp[iu], pred.Sigma[iu])[0, 1] > 0.95
+
+
+def test_post_sample_paths_match_exact_draws_from_the_joint_covariance(booth_data):
+    """Paths must be genuine joint draws, not pointwise-independent ones.
+
+    Marginal moments cannot tell those apart, so this compares a statistic
+    that *is* sensitive to joint structure -- mean absolute successive
+    difference along a path -- against exact multivariate-normal draws from
+    the analytic covariance that ``predict(lite=False)`` returns.
+
+    Note the reference must be the exact draws, not "smoother than
+    independent": an interpolating GP has strongly *negative* predictive
+    correlation between design points (here adjacent correlation ranges from
+    +0.95 to -0.94), so joint paths are not uniformly smoother than
+    independent ones and a roughness threshold alone would be misleading.
+    """
+    x, y, xp, _ = booth_data
+    fit = fit_two_layer(x, y, nmcmc=600, true_g=1e-6, verb=False, seed=2,
+                        m=10).trim(300, 2)
+    paths = fit.post_sample(xp, rng=np.random.default_rng(11))
+    pred = fit.predict(xp, lite=False, rng=np.random.default_rng(8))
+
+    def roughness(a):
+        return np.abs(np.diff(a, axis=1)).mean()
+
+    rng = np.random.default_rng(12)
+    L = np.linalg.cholesky(pred.Sigma + 1e-12 * np.eye(len(xp)))
+    exact = pred.mean + (L @ rng.standard_normal((len(xp), paths.shape[0]))).T
+    independent = pred.mean + rng.standard_normal(paths.shape) * np.sqrt(
+        np.diag(pred.Sigma)
+    )
+
+    r_joint, r_exact, r_indep = roughness(paths), roughness(exact), roughness(independent)
+    assert r_joint == pytest.approx(r_exact, rel=0.05)
+    # and the statistic has the power to detect the failure mode it guards
+    assert abs(r_joint - r_exact) < 0.25 * abs(r_indep - r_exact), (
+        f"roughness {r_joint:.4f} vs exact {r_exact:.4f}, "
+        f"pointwise-independent {r_indep:.4f}"
+    )
+
+
+def test_post_sample_is_available_on_every_model(booth_data):
+    x, y, xp, _ = booth_data
+    xp = xp[::10]
+    for fn, kw in ((fit_one_layer, {}), (fit_two_layer, {}), (fit_three_layer, {})):
+        fit = fn(x, y, nmcmc=200, true_g=1e-6, verb=False, seed=3, m=8).trim(100, 2)
+        paths = fit.post_sample(xp, nper=3, rng=np.random.default_rng(4))
+        assert paths.shape == (3 * fit.nmcmc, len(xp))
+        assert np.all(np.isfinite(paths))
+
+
 def test_two_layer_beats_one_layer_on_a_nonstationary_function(booth_data):
     x, y, xp, yp = booth_data
     gp = fit_one_layer(x, y, nmcmc=2000, true_g=1e-6, verb=False, seed=1,

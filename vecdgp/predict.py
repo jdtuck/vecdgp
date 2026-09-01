@@ -65,7 +65,7 @@ def _g_at(g, t):
 # one layer
 # ---------------------------------------------------------------------------
 def predict_shallow_vec(obj, x_new, m=None, lite=True, order_new=None,
-                        return_all=False, rng=None):
+                        return_all=False, rng=None, samples_only=False, nper=1):
     rng = np.random.default_rng() if rng is None else rng
     x_new = _as2d(x_new)
     if x_new.shape[1] != obj.x.shape[1]:
@@ -73,6 +73,8 @@ def predict_shallow_vec(obj, x_new, m=None, lite=True, order_new=None,
     n_new = x_new.shape[0]
     n = obj.x.shape[0]
     sep = obj.settings.sep
+    if samples_only:
+        lite = False  # joint sampling needs the stacked ordering
 
     if m is None:
         m = min(n, 2 * obj.x_approx.m) if lite else min(n + n_new - 1, 2 * obj.x_approx.m)
@@ -81,16 +83,21 @@ def predict_shallow_vec(obj, x_new, m=None, lite=True, order_new=None,
     ap.clean_pred()
     ap.add_pred(x_new, m, lite=lite, order_new=order_new, rng=rng)
 
+    samples = np.empty((nper * obj.nmcmc, n_new)) if samples_only else None
     mu_t = np.empty((obj.nmcmc, n_new))
     s2_sum = np.zeros(n_new)
     sigma_sum = np.zeros((n_new, n_new))
     s2_t = np.empty((obj.nmcmc, n_new)) if (lite and return_all) else None
 
     for t in range(obj.nmcmc):
-        theta_t = obj.theta[t] if sep else obj.theta[t]
-        k = krig_vec(obj.y, ap, tau2=obj.tau2[t], theta=theta_t,
+        k = krig_vec(obj.y, ap, tau2=obj.tau2[t], theta=obj.theta[t],
                      g=_g_at(obj.g, t), v=obj.v, sep=sep,
-                     s2=lite, sigma=not lite, rng=rng)
+                     s2=lite and not samples_only,
+                     sigma=(not lite) and not samples_only,
+                     nsamples=nper if samples_only else 0, rng=rng)
+        if samples_only:
+            samples[t * nper : (t + 1) * nper] = k["samples"]
+            continue
         mu_t[t] = k["mean"]
         if lite:
             s2_sum += k["s2"]
@@ -99,6 +106,8 @@ def predict_shallow_vec(obj, x_new, m=None, lite=True, order_new=None,
         else:
             sigma_sum += k["sigma"]
 
+    if samples_only:
+        return samples
     return _combine(mu_t, s2_sum, sigma_sum, obj.nmcmc, lite, return_all, s2_t)
 
 
@@ -107,7 +116,7 @@ def predict_shallow_vec(obj, x_new, m=None, lite=True, order_new=None,
 # ---------------------------------------------------------------------------
 def predict_deep_vec(obj, x_new, m=None, lite=True, mean_map=True,
                      store_latent=False, order_new=None, return_all=False,
-                     layers=2, rng=None):
+                     layers=2, rng=None, samples_only=False, nper=1):
     rng = np.random.default_rng() if rng is None else rng
     x_new = _as2d(x_new)
     if x_new.shape[1] != obj.x.shape[1]:
@@ -115,6 +124,8 @@ def predict_deep_vec(obj, x_new, m=None, lite=True, mean_map=True,
     n_new = x_new.shape[0]
     n = len(obj.y)
     D = obj.w.shape[2]
+    if samples_only:
+        lite = False  # joint sampling needs the stacked ordering
 
     if m is None:
         m = min(n, 2 * obj.w_approx.m) if lite else min(n + n_new - 1, 2 * obj.w_approx.m)
@@ -126,6 +137,7 @@ def predict_deep_vec(obj, x_new, m=None, lite=True, mean_map=True,
     obj.x_approx.add_pred(x_new, min(n, m) if mean_map else m,
                           lite=mean_map, order_new=order_new, rng=rng)
 
+    samples = np.empty((nper * obj.nmcmc, n_new)) if samples_only else None
     mu_t = np.empty((obj.nmcmc, n_new))
     s2_sum = np.zeros(n_new)
     sigma_sum = np.zeros((n_new, n_new))
@@ -180,7 +192,12 @@ def predict_deep_vec(obj, x_new, m=None, lite=True, mean_map=True,
 
         k = krig_vec(obj.y, obj.w_approx, tau2=obj.tau2_y[t],
                      theta=obj.theta_y[t], g=g_t, v=obj.v,
-                     s2=lite, sigma=not lite, rng=rng)
+                     s2=lite and not samples_only,
+                     sigma=(not lite) and not samples_only,
+                     nsamples=nper if samples_only else 0, rng=rng)
+        if samples_only:
+            samples[t * nper : (t + 1) * nper] = k["samples"]
+            continue
         mu_t[t] = k["mean"]
         if lite:
             s2_sum += k["s2"]
@@ -189,6 +206,8 @@ def predict_deep_vec(obj, x_new, m=None, lite=True, mean_map=True,
         else:
             sigma_sum += k["sigma"]
 
+    if samples_only:
+        return samples
     out = _combine(mu_t, s2_sum, sigma_sum, obj.nmcmc, lite, return_all, s2_t)
     if store_latent:
         out["w_new"] = w_new_store

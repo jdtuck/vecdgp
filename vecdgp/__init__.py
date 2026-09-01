@@ -20,6 +20,15 @@ Quick start
 >>> p = fit.predict(np.linspace(0, 1, 100)[:, None])
 >>> p.mean.shape, p.s2.shape
 ((100,), (100,))
+
+``predict`` returns summarised moments; ``post_sample`` returns whole
+posterior draws of the surface, for functionals a pointwise band cannot
+express (argmax distributions, excursion probabilities, downstream
+propagation):
+
+>>> paths = fit.post_sample(np.linspace(0, 1, 100)[:, None])
+>>> paths.shape
+(250, 100)
 """
 
 from ._compat import HAVE_NUMBA
@@ -46,7 +55,7 @@ from .vecchia import (
     rand_mvn_vec,
 )
 
-__version__ = "0.1.2"
+__version__ = "0.2.0"
 
 __all__ = [
     "fit_one_layer",

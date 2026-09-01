@@ -1,5 +1,6 @@
 [![Pipeline Status](https://github.com/jdtuck/vecdgp/actions/workflows/Build.yml/badge.svg)](https://github.com/jdtuck/vecdgp/actions/workflows/Build.yml)
 
+
 # vecdgp — Vecchia-approximated deep Gaussian processes in Python
 
 A from-scratch Python implementation of
@@ -58,7 +59,29 @@ pred.mean, pred.s2
 
 pred = fit.predict(xp, lite=False)         # joint: full predictive covariance
 pred.Sigma
+
+paths = fit.post_sample(xp)                # joint posterior sample paths
+paths.shape                                # (nmcmc, len(xp)) -- one per draw
 ```
+
+`predict` summarises; `post_sample` draws whole functions. Use the paths for
+anything that is a *functional* of the surface rather than a pointwise
+summary — the distribution of the argmax, threshold-crossing or excursion
+probabilities, or propagating surrogate uncertainty into a downstream
+calculation. A pointwise band cannot express those, because they depend on how
+the uncertainty at one location correlates with the next:
+
+![post_sample](examples/post_sample.png)
+
+The posterior over the argmax is clearly multi-modal — about a third of the
+draws put the maximum somewhere other than the mode. The posterior mean gives
+you one number and no way to see that.
+
+Sampling is sequential over test locations (paper, Sec. 3.4): each location
+conditions on the training data *and* on the locations already drawn in that
+path, so no dense `n_new x n_new` covariance is ever formed. `nper` raises the
+draws per MCMC iteration; `mean_map=False` additionally samples the latent
+layer rather than using its conditional mean.
 
 The R equivalent is
 
@@ -120,15 +143,16 @@ vecdgp/
   gibbs.py      the 1-/2-/3-layer Gibbs sweeps
   krig.py       point-wise, joint, and sequential-sample prediction
   predict.py    averaging over MCMC draws, latent-layer mapping
-  fit.py        fit_one_layer / fit_two_layer / fit_three_layer, trim, model objects
+  fit.py        fit_one_layer / fit_two_layer / fit_three_layer, trim, predict, post_sample
   settings.py   deepgp's default priors and proposal windows
   metrics.py    rmse / crps / score, safe_cholesky
   diagnose.py   `python -m vecdgp.diagnose` environment + numerical self-check
 examples/
   demo_booth.py    the deepgp vignette's 1-D nonstationary example
   demo_scaling.py  timing vs n, fits the exponent
+  demo_post_sample.py  sample paths, and a functional a band cannot give you
 tests/
-  test_vecdgp.py   30 tests
+  test_vecdgp.py   33 tests
 bench/
   ubench.cpp       C++/OpenMP transliteration of u_entries
   run_bench.py     races numba against it
@@ -137,7 +161,7 @@ bench/
 
 ## Correctness
 
-Run `pytest tests -q` (30 tests, ~20 s). The core idea: **when `m = n − 1` the
+Run `pytest tests -q` (33 tests, ~20 s). The core idea: **when `m = n − 1` the
 Vecchia approximation is exact**, so every approximated quantity must
 reproduce the dense-GP calculation to machine precision.
 
@@ -152,6 +176,10 @@ reproduce the dense-GP calculation to machine precision.
   variances at full `m`, and agree with each other.
 - 30 000 sequential posterior samples reproduce the joint predictive mean and
   covariance.
+- `post_sample` paths reproduce `predict(lite=False)`'s mean and full
+  covariance (off-diagonal correlation > 0.95), and match exact MVN draws from
+  that covariance on a statistic sensitive to joint structure — one that also
+  separates them from pointwise-independent draws.
 - `score` matches `multivariate_normal.logpdf` to 1e-9, and stays finite and
   warning-free on a covariance whose determinant underflows to zero.
 - End-to-end: the two-layer DGP beats the one-layer GP on RMSE **and** CRPS on
