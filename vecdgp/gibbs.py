@@ -16,6 +16,8 @@ per-sweep cost is ``O(n m^3)`` rather than ``O(n^3)``.
 
 from __future__ import annotations
 
+import time
+
 import numpy as np
 
 from .mcmc import logl_vec, sample_g_vec, sample_theta_vec, sample_w_vec, sample_z_vec
@@ -43,9 +45,55 @@ def init_latent(x, D):
     return np.resize(flat, n * D).reshape(n, D, order="F").copy()
 
 
-def _progress(verb, j, nmcmc):
-    if verb and j % 500 == 0:
-        print(f"  mcmc {j}/{nmcmc}", flush=True)
+class _Progress:
+    """Progress reporter with an ETA.
+
+    A fit at n in the thousands runs for hours, so a bare iteration counter
+    is not much use; this reports the measured sweep rate and a projected
+    finish.  It also surfaces the thread count on the first tick, because a
+    numba install that ends up single-threaded is the most common cause of a
+    fit being unexpectedly slow (cost is very close to linear in cores).
+    """
+
+    def __init__(self, verb, nmcmc, every=100):
+        self.verb = verb
+        self.nmcmc = nmcmc
+        self.every = every
+        self.t0 = time.time()
+        self.announced = False
+
+    def __call__(self, j):
+        if not self.verb or j % self.every != 0:
+            return
+        if not self.announced:
+            self.announced = True
+            try:
+                from numba import get_num_threads
+
+                nt = get_num_threads()
+                note = f" on {nt} thread{'s' if nt != 1 else ''}"
+                if nt == 1:
+                    note += "  (cost is ~linear in cores -- see README)"
+            except Exception:
+                note = " without numba (much slower -- see README)"
+            print(f"  mcmc{note}", flush=True)
+        el = time.time() - self.t0
+        rate = el / j
+        left = rate * (self.nmcmc - j)
+        print(
+            f"  mcmc {j}/{self.nmcmc}  {rate:.3f} s/sweep  "
+            f"elapsed {_hms(el)}  eta {_hms(left)}",
+            flush=True,
+        )
+
+
+def _hms(s):
+    s = int(s)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m{s % 60:02d}s"
+    return f"{s // 3600}h{(s % 3600) // 60:02d}m"
 
 
 # ---------------------------------------------------------------------------
@@ -77,8 +125,9 @@ def gibbs_one_layer_vec(x, y, nmcmc, verb, initial, true_g, settings, v, m,
     ll_store = np.full(nmcmc, np.nan)
     ll = None
 
+    report = _Progress(verb, nmcmc)
     for j in range(1, nmcmc):
-        _progress(verb, j, nmcmc)
+        report(j)
         tau2[j] = tau2[j - 1]  # carry forward until an acceptance updates it
 
         if est_g:
@@ -153,8 +202,9 @@ def gibbs_two_layer_vec(x, y, nmcmc, D, verb, initial, true_g, settings, v, m,
 
     prior_mean = x if settings.pmx else None
 
+    report = _Progress(verb, nmcmc)
     for j in range(1, nmcmc):
-        _progress(verb, j, nmcmc)
+        report(j)
 
         if est_g:
             g, ll_outer, _ = sample_g_vec(
@@ -234,8 +284,9 @@ def gibbs_three_layer_vec(x, y, nmcmc, D, verb, initial, true_g, settings, v, m,
     if w_approx is None:
         w_approx = create_approx(w[0], m, order, rng=rng)
 
+    report = _Progress(verb, nmcmc)
     for j in range(1, nmcmc):
-        _progress(verb, j, nmcmc)
+        report(j)
 
         if est_g:
             g, ll_outer, _ = sample_g_vec(

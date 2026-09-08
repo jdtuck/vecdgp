@@ -1,6 +1,5 @@
 [![Pipeline Status](https://github.com/jdtuck/vecdgp/actions/workflows/Build.yml/badge.svg)](https://github.com/jdtuck/vecdgp/actions/workflows/Build.yml)
 
-
 # vecdgp — Vecchia-approximated deep Gaussian processes in Python
 
 A from-scratch Python implementation of
@@ -268,6 +267,69 @@ is larger than that.
 
 **Very slow.** Check `vecdgp using numba: True` in the diagnostic. Without
 numba every kernel falls back to interpreted loops.
+
+## If it's slow
+
+Measured at **n = 6000, d = 2, m = 25, two-layer, on a 2-core box**. Start with
+`python -m vecdgp.diagnose`, which reports your thread count.
+
+**1. Check your core count first.** Cost is essentially linear in cores — the
+row loop over `U` is embarrassingly parallel:
+
+| threads | s/sweep | nmcmc = 10 000 |
+| --- | --- | --- |
+| 1 | 1.068 | 2.97 h |
+| 2 | 0.536 | 1.49 h |
+
+That's 1.99x from one extra core. This box only has 2; on 16 you should expect
+roughly 0.07 s/sweep (~11 min). A numba install that silently ends up
+single-threaded is the most common cause of an unexpectedly slow fit, so
+`fit_*(verb=True)` now prints the thread count and a running ETA:
+
+```
+  mcmc on 2 threads
+  mcmc 100/10000  0.536 s/sweep  elapsed 54s  eta 1h28m
+```
+
+**2. `m` is the strongest knob you control.** Cost is `O(n m³)`, so it bites
+hard:
+
+| m | s/sweep | nmcmc = 10 000 |
+| --- | --- | --- |
+| 10 | 0.158 | 0.44 h |
+| 15 | 0.219 | 0.61 h |
+| 25 (default) | 0.537 | 1.49 h |
+| 40 | 1.433 | 3.98 h |
+
+The paper's default is 25. Dropping to 15 is 2.4x faster; check the
+approximation still holds for your problem by comparing predictions at both.
+
+**3. Prediction defaults to `m = 2 × m_fit`** (following `deepgp`), which is 8x
+the Cholesky work of the fit. Passing `m` explicitly is the easy win:
+
+| call | ms/draw | 500 draws |
+| --- | --- | --- |
+| `predict()` | 37 | 19 s |
+| `predict(m=25)` | 12 | 6 s |
+| `post_sample()` | 132 | 66 s |
+| `post_sample(m=25)` | 55 | 27 s |
+| `predict(lite=False)` | 361 | 181 s |
+
+`lite=False` is far more expensive than `lite=True` and you rarely need it —
+only ask for the full covariance if you actually use the off-diagonals.
+`trim(burn, thin)` cuts prediction cost proportionally, since every retained
+draw is predicted separately.
+
+**Where the time goes.** For the fit, 60% is elliptical slice sampling, 27%
+the lengthscale updates — and essentially all of it is one function,
+`u_entries`, building the sparse Cholesky factor. That is already at its
+practical floor: it matches hand-written C++/OpenMP (see
+[Performance](#performance)), and hoisting its per-row allocations measured as
+no gain. What is left is dominated by `exp`/`sqrt` — a 26x26 block is ~350
+transcendentals against ~5 900 flops of factorisation. SIMD-vectorised
+transcendentals (numba picks these up via Intel SVML) would be the next real
+step; SVML would not load on this box, so that gain is untested rather than
+dismissed.
 
 ## Scope
 

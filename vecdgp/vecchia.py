@@ -219,27 +219,49 @@ def find_ordered_nn(x, m):
         nearest = nearest[np.argsort(d2[nearest], kind="stable")]
         NN[i, 1 : 1 + k] = nearest
 
-    # KD-tree sweeps for the rest, doubling the search width for stragglers
-    pending = np.arange(n_brute, n)
-    msearch = m
-    while pending.size:
-        hi = int(pending.max()) + 1
-        msearch = min(hi, 2 * msearch)
-        tree = cKDTree(x[:hi])
-        _, idx = tree.query(x[pending], k=min(msearch, hi))
-        idx = np.atleast_2d(idx)
-        done = []
-        for r, i in enumerate(pending):
-            cand = idx[r]
-            cand = cand[cand <= i]
-            if cand.size >= m + 1:
-                NN[i, :] = cand[: m + 1]
-                done.append(r)
-        if not done:
-            if msearch >= hi:  # cannot search wider; should not happen
-                raise RuntimeError("failed to build conditioning sets")
-            continue
-        pending = np.delete(pending, done)
+    # Doubling blocks for the rest.
+    #
+    # A conditioning set may only reference *predecessors*, but a KD-tree
+    # knows nothing about the ordering, so neighbours have to be found by
+    # distance and then filtered by index.  Under the random ordering the two
+    # are independent, so among the k nearest neighbours of point i only about
+    # k*i/n survive the filter -- for small i that is almost none, and a
+    # single global sweep has to keep doubling k over *all* points to satisfy
+    # its worst row.  That is what made this the dominant cost of joint
+    # prediction (it is rebuilt at every MCMC draw).
+    #
+    # Processing in doubling blocks [a, 2a) instead bounds the damage: the
+    # tree holds x[:b], of which at most half can fail the index filter, so a
+    # modest k suffices and each point is queried once against a tree no
+    # larger than it needs.  k = 2(m+1) measured fastest across n: a wider
+    # first query costs more than the occasional doubling it avoids.
+    # Exactness is unchanged -- every candidate is still the true nearest
+    # predecessor set.
+    a = n_brute
+    while a < n:
+        b = int(min(n, 2 * a))
+        tree = _build_tree(x[:b])
+        pending = np.arange(a, b)
+        k = int(min(b, 2 * (m + 1)))
+        while pending.size:
+            _, idx = tree.query(x[pending], k=k, workers=-1)
+            idx = np.atleast_2d(np.asarray(idx, dtype=np.int64))
+
+            # `idx` is distance-sorted, and a *stable* argsort on the validity
+            # mask floats the predecessors to the front preserving that order.
+            valid = idx <= pending[:, None]
+            enough = valid.sum(axis=1) >= m + 1
+            if enough.any():
+                order = np.argsort(~valid[enough], axis=1, kind="stable")
+                NN[pending[enough]] = np.take_along_axis(
+                    idx[enough], order[:, : m + 1], axis=1
+                )
+                pending = pending[~enough]
+            if pending.size:
+                if k >= b:  # unreachable: every row here has >= 2m+1 predecessors
+                    raise RuntimeError("failed to build conditioning sets")
+                k = int(min(b, 2 * k))
+        a = b
     return NN, _nn_len(NN)
 
 
@@ -247,11 +269,23 @@ def _nn_len(NN):
     return (NN >= 0).sum(axis=1).astype(np.int64)
 
 
+def _build_tree(pts):
+    """KD-tree tuned for build-once-query-once use.
+
+    Both prediction paths rebuild a tree at *every* MCMC draw (the warped
+    coordinates change), so construction cost matters as much as query cost.
+    Sliding-midpoint splits skip the median-finding that ``balanced_tree``
+    does, which is markedly cheaper to build for a negligible query penalty
+    at these sizes.
+    """
+    return cKDTree(pts, compact_nodes=False, balanced_tree=False)
+
+
 def _knnx(reference, query, k):
     """``k`` nearest neighbours of each query point among ``reference``."""
     k = int(min(k, reference.shape[0]))
-    tree = cKDTree(reference)
-    _, idx = tree.query(query, k=k)
+    tree = _build_tree(reference)
+    _, idx = tree.query(query, k=k, workers=-1)
     idx = np.asarray(idx, dtype=np.int64)
     if idx.ndim == 1:
         idx = idx.reshape(-1, 1) if k == 1 else idx.reshape(1, -1)
