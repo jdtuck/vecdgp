@@ -49,3 +49,46 @@ else:  # pragma: no cover - fallback path
 
 
 __all__ = ["njit", "prange", "HAVE_NUMBA"]
+
+
+# ---------------------------------------------------------------------------
+# nested-parallelism guard
+# ---------------------------------------------------------------------------
+import threading  # noqa: E402
+
+_TLS = threading.local()
+
+
+class in_worker_thread:
+    """Mark a block as running inside vecdgp's own thread pool.
+
+    Numba's ``parallel=True`` kernels must NOT be entered from several Python
+    threads at once.  The ``workqueue`` threading layer -- numba's fallback,
+    and what a stock macOS install typically gets -- detects this and aborts
+    the process outright::
+
+        Numba workqueue threading layer is terminating:
+        Concurrent access has been detected.
+
+    (``omp`` and ``tbb`` tolerate it, which is why this never showed up on
+    Linux CI.)  Rather than depend on the threading layer, every parallel
+    kernel here has a serial twin, and this flag selects it.  Draw-level
+    parallelism then provides all the concurrency, with no nesting at all.
+    """
+
+    def __enter__(self):
+        self.prev = getattr(_TLS, "worker", False)
+        _TLS.worker = True
+        return self
+
+    def __exit__(self, *exc):
+        _TLS.worker = self.prev
+        return False
+
+
+def in_worker():
+    """True when the caller is inside :class:`in_worker_thread`."""
+    return getattr(_TLS, "worker", False)
+
+
+__all__ += ["in_worker", "in_worker_thread"]

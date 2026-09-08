@@ -25,6 +25,7 @@ from contextlib import contextmanager
 
 import numpy as np
 
+from ._compat import in_worker_thread
 from .krig import krig_vec
 from .vecchia import EPS
 
@@ -139,7 +140,11 @@ def _run_draws(body, nmcmc, cores, rng):
     its own copies of anything the draw loop writes to.
     """
     rngs = _spawn(rng, nmcmc)
-    if cores <= 1 or nmcmc < 2:
+    # With fewer draws than cores, splitting them would leave cores idle --
+    # each worker runs the *serial* kernels.  Better to keep the draw loop
+    # serial and let numba's prange use the full width instead.  Picking one
+    # axis or the other also means the two are never nested.
+    if cores <= 1 or nmcmc < 2 or nmcmc < cores:
         for t in range(nmcmc):
             body(t, rngs[t], 0)
         return
@@ -148,8 +153,10 @@ def _run_draws(body, nmcmc, cores, rng):
 
     def work(args):
         w, ts = args
-        for t in ts:
-            body(t, rngs[t], w)
+        # inside the pool every numba kernel must take its serial path
+        with in_worker_thread():
+            for t in ts:
+                body(t, rngs[t], w)
 
     inner = max(1, resolve_cores(None) // len(parts))
     with _numba_threads(inner):

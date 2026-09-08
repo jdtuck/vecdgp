@@ -35,7 +35,7 @@ import numpy as np
 from scipy.linalg import solve_triangular
 from scipy.sparse.linalg import spsolve_triangular
 
-from ._compat import njit, prange
+from ._compat import in_worker, njit, prange
 from .kernels import _theta_vec, fill_cov_sym
 from .vecchia import EPS, _chol_lower, create_U_sparse
 
@@ -45,52 +45,73 @@ __all__ = ["krig_vec"]
 # ---------------------------------------------------------------------------
 # point-wise ("lite") prediction
 # ---------------------------------------------------------------------------
-@njit(cache=True, parallel=True, nogil=True)
-def _krig_lite(x_ord, x_new, NN_new, yo, tau2, theta, g, v, sep, want_s2):
-    n_new = x_new.shape[0]
+@njit(cache=True, nogil=True)
+def _krig_lite_row(i, x_ord, x_new, NN_new, yo, tau2, theta, g, v, sep, want_s2,
+                   mu, s2):
+    """One test location.  Shared by the parallel and serial shells."""
     d = x_new.shape[1]
     m = NN_new.shape[1]
     n0 = m + 1
+    pts = np.empty((n0, d))
+    for j in range(m):
+        idx = NN_new[i, j]
+        for k in range(d):
+            pts[j, k] = x_ord[idx, k]
+    for k in range(d):
+        pts[m, k] = x_new[i, k]
+
+    K = np.empty((n0, n0))
+    fill_cov_sym(K, pts, n0, 1.0, theta, g, v, sep)
+    if _chol_lower(K, n0) != 0:
+        trace = 0.0
+        fill_cov_sym(K, pts, n0, 1.0, theta, g, v, sep)
+        for k in range(n0):
+            trace += K[k, k]
+        jit = 1e-10 * trace / n0
+        for _ in range(10):
+            fill_cov_sym(K, pts, n0, 1.0, theta, g, v, sep)
+            for k in range(n0):
+                K[k, k] += jit
+            if _chol_lower(K, n0) == 0:
+                break
+            jit *= 10.0
+
+    # a = L[:m, :m]^{-1} y[NN]
+    a = np.empty(m)
+    for r in range(m):
+        acc = yo[NN_new[i, r]]
+        for c in range(r):
+            acc -= K[r, c] * a[c]
+        a[r] = acc / K[r, r]
+    s = 0.0
+    for r in range(m):
+        s += K[m, r] * a[r]
+    mu[i] = s
+    if want_s2:
+        s2[i] = tau2 * K[m, m] * K[m, m]
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def _krig_lite(x_ord, x_new, NN_new, yo, tau2, theta, g, v, sep, want_s2):
+    n_new = x_new.shape[0]
     mu = np.zeros(n_new)
     s2 = np.zeros(n_new)
     for i in prange(n_new):
-        pts = np.empty((n0, d))
-        for j in range(m):
-            idx = NN_new[i, j]
-            for k in range(d):
-                pts[j, k] = x_ord[idx, k]
-        for k in range(d):
-            pts[m, k] = x_new[i, k]
+        _krig_lite_row(i, x_ord, x_new, NN_new, yo, tau2, theta, g, v,
+                       sep, want_s2, mu, s2)
+    return mu, s2
 
-        K = np.empty((n0, n0))
-        fill_cov_sym(K, pts, n0, 1.0, theta, g, v, sep)
-        if _chol_lower(K, n0) != 0:
-            trace = 0.0
-            fill_cov_sym(K, pts, n0, 1.0, theta, g, v, sep)
-            for k in range(n0):
-                trace += K[k, k]
-            jit = 1e-10 * trace / n0
-            for _ in range(10):
-                fill_cov_sym(K, pts, n0, 1.0, theta, g, v, sep)
-                for k in range(n0):
-                    K[k, k] += jit
-                if _chol_lower(K, n0) == 0:
-                    break
-                jit *= 10.0
 
-        # a = L[:m, :m]^{-1} y[NN]
-        a = np.empty(m)
-        for r in range(m):
-            acc = yo[NN_new[i, r]]
-            for c in range(r):
-                acc -= K[r, c] * a[c]
-            a[r] = acc / K[r, r]
-        s = 0.0
-        for r in range(m):
-            s += K[m, r] * a[r]
-        mu[i] = s
-        if want_s2:
-            s2[i] = tau2 * K[m, m] * K[m, m]
+@njit(cache=True, nogil=True)
+def _krig_lite_serial(x_ord, x_new, NN_new, yo, tau2, theta, g, v, sep,
+                      want_s2):
+    """Serial twin of :func:`_krig_lite` -- see :mod:`vecdgp._compat`."""
+    n_new = x_new.shape[0]
+    mu = np.zeros(n_new)
+    s2 = np.zeros(n_new)
+    for i in range(n_new):
+        _krig_lite_row(i, x_ord, x_new, NN_new, yo, tau2, theta, g, v,
+                       sep, want_s2, mu, s2)
     return mu, s2
 
 
@@ -195,7 +216,8 @@ def krig_vec(y, approx, tau2=1.0, theta=0.1, g=0.0, v=2.5, sep=False,
         raise ValueError("approx is not lite; request sigma instead of s2")
 
     if lite:
-        mu, s2v = _krig_lite(
+        kernel = _krig_lite_serial if in_worker() else _krig_lite
+        mu, s2v = kernel(
             approx.x_ord, np.ascontiguousarray(approx.x_new), approx.NN_new,
             yo, float(tau2), th, float(g), float(v), bool(sep), bool(s2),
         )

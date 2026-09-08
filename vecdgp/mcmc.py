@@ -17,7 +17,7 @@ import math
 
 import numpy as np
 
-from .vecchia import EPS, create_U_values, rand_mvn_vec, ut_mult
+from .vecchia import EPS, create_U_values, rand_mvn_vec, ut_mult_auto
 
 __all__ = [
     "logl_vec",
@@ -68,7 +68,7 @@ def logl_vec(y, approx, tau2=1.0, theta=0.1, g=0.0, v=2.5, mu=0.0,
         y_ord = y_ord - mu
 
     Uvals = create_U_values(approx, tau2=tau2, theta=theta, g=g, v=v, sep=sep)
-    Uty = ut_mult(Uvals, approx.NN, approx.NN_len, np.ascontiguousarray(y_ord))
+    Uty = ut_mult_auto(Uvals, approx.NN, approx.NN_len, np.ascontiguousarray(y_ord))
     quad = float(np.dot(Uty, Uty))
     logdet = float(np.log(Uvals[:, 0]).sum())
 

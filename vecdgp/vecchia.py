@@ -57,7 +57,7 @@ import numpy as np
 from scipy.spatial import cKDTree
 import scipy.sparse as sp
 
-from ._compat import njit, prange
+from ._compat import in_worker, njit, prange
 from .kernels import fill_cov_sym, _as2d, _theta_vec
 
 EPS = float(np.sqrt(np.finfo(float).eps))
@@ -69,10 +69,13 @@ __all__ = [
     "find_ordered_nn",
     "create_approx",
     "u_entries",
+    "u_entries_serial",
     "create_U_values",
     "create_U_sparse",
     "forward_solve_ut",
     "ut_mult",
+    "ut_mult_serial",
+    "ut_mult_auto",
     "rand_mvn_vec",
 ]
 
@@ -139,6 +142,23 @@ def _u_column(pts, n0, tau2, theta, g, v, sep, cov, out):
         out[k] = m[last - k]
 
 
+@njit(cache=True, nogil=True)
+def _u_row(i, x_ord, NN, NN_len, tau2, theta, g, v, sep, Uvals):
+    """One row of ``U``.  Shared by the parallel and serial shells below."""
+    d = x_ord.shape[1]
+    n0 = NN_len[i]
+    pts = np.empty((n0, d))
+    for j in range(n0):
+        idx = NN[i, n0 - 1 - j]  # conditioning set first, point i last
+        for k in range(d):
+            pts[j, k] = x_ord[idx, k]
+    cov = np.empty((n0, n0))
+    out = np.empty(n0)
+    _u_column(pts, n0, tau2, theta, g, v, sep, cov, out)
+    for k in range(n0):
+        Uvals[i, k] = out[k]
+
+
 @njit(cache=True, parallel=True, nogil=True)
 def u_entries(x_ord, NN, NN_len, tau2, theta, g, v, sep):
     """Entries of the sparse upper-triangular Cholesky factor ``U``.
@@ -147,21 +167,24 @@ def u_entries(x_ord, NN, NN_len, tau2, theta, g, v, sep):
     ``NN[i, k]``, column ``i``.
     """
     n = x_ord.shape[0]
-    d = x_ord.shape[1]
-    mp1 = NN.shape[1]
-    Uvals = np.zeros((n, mp1))
+    Uvals = np.zeros((n, NN.shape[1]))
     for i in prange(n):
-        n0 = NN_len[i]
-        pts = np.empty((n0, d))
-        for j in range(n0):
-            idx = NN[i, n0 - 1 - j]  # conditioning set first, point i last
-            for k in range(d):
-                pts[j, k] = x_ord[idx, k]
-        cov = np.empty((n0, n0))
-        out = np.empty(n0)
-        _u_column(pts, n0, tau2, theta, g, v, sep, cov, out)
-        for k in range(n0):
-            Uvals[i, k] = out[k]
+        _u_row(i, x_ord, NN, NN_len, tau2, theta, g, v, sep, Uvals)
+    return Uvals
+
+
+@njit(cache=True, nogil=True)
+def u_entries_serial(x_ord, NN, NN_len, tau2, theta, g, v, sep):
+    """Serial twin of :func:`u_entries`.
+
+    Used when the caller is already inside vecdgp's thread pool -- entering a
+    ``parallel=True`` kernel from several threads aborts the process under
+    numba's ``workqueue`` threading layer.  See :mod:`vecdgp._compat`.
+    """
+    n = x_ord.shape[0]
+    Uvals = np.zeros((n, NN.shape[1]))
+    for i in range(n):
+        _u_row(i, x_ord, NN, NN_len, tau2, theta, g, v, sep, Uvals)
     return Uvals
 
 
@@ -178,16 +201,31 @@ def forward_solve_ut(Uvals, NN, NN_len, z):
     return y
 
 
+@njit(cache=True, nogil=True, inline="always")
+def _ut_row(i, Uvals, NN, NN_len, vvec):
+    s = 0.0
+    for k in range(NN_len[i]):
+        s += Uvals[i, k] * vvec[NN[i, k]]
+    return s
+
+
 @njit(cache=True, parallel=True, nogil=True)
 def ut_mult(Uvals, NN, NN_len, vvec):
     """Compute ``U^T v`` exploiting the sparsity pattern."""
     n = vvec.shape[0]
     out = np.zeros(n)
     for i in prange(n):
-        s = 0.0
-        for k in range(NN_len[i]):
-            s += Uvals[i, k] * vvec[NN[i, k]]
-        out[i] = s
+        out[i] = _ut_row(i, Uvals, NN, NN_len, vvec)
+    return out
+
+
+@njit(cache=True, nogil=True)
+def ut_mult_serial(Uvals, NN, NN_len, vvec):
+    """Serial twin of :func:`ut_mult` -- see :func:`u_entries_serial`."""
+    n = vvec.shape[0]
+    out = np.zeros(n)
+    for i in range(n):
+        out[i] = _ut_row(i, Uvals, NN, NN_len, vvec)
     return out
 
 
@@ -412,12 +450,23 @@ def create_approx(x, m, order=None, rng=None):
 # derived quantities
 # ---------------------------------------------------------------------------
 def create_U_values(approx, tau2=1.0, theta=0.1, g=0.0, v=2.5, sep=False):
-    """Raw ``U`` entries for the current coordinates of ``approx``."""
+    """Raw ``U`` entries for the current coordinates of ``approx``.
+
+    Dispatches to the serial kernel when already running inside vecdgp's
+    thread pool, so a ``parallel=True`` region is never entered concurrently.
+    """
     th = _theta_vec(theta, approx.x_ord.shape[1], sep)
-    return u_entries(
+    kernel = u_entries_serial if in_worker() else u_entries
+    return kernel(
         approx.x_ord, approx.NN, approx.NN_len,
         float(tau2), th, float(g), float(v), bool(sep),
     )
+
+
+def ut_mult_auto(Uvals, NN, NN_len, vvec):
+    """``U^T v``, serial or parallel depending on the calling context."""
+    kernel = ut_mult_serial if in_worker() else ut_mult
+    return kernel(Uvals, NN, NN_len, vvec)
 
 
 def create_U_sparse(approx, tau2=1.0, theta=0.1, g=0.0, v=2.5, sep=False):

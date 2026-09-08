@@ -17,13 +17,13 @@ cost is **`O(n m³)` per sweep — linear in `n`** instead of the `O(n³)` of a
 dense deep GP.
 
 ```
-n =    500     0.045 s / MCMC sweep
-n =   1000     0.082 s / MCMC sweep
-n =   2000     0.165 s / MCMC sweep
-n =   4000     0.346 s / MCMC sweep
-n =   8000     0.665 s / MCMC sweep
+n =    500     0.031 s / MCMC sweep
+n =   1000     0.061 s / MCMC sweep
+n =   2000     0.123 s / MCMC sweep
+n =   4000     0.259 s / MCMC sweep
+n =   8000     0.496 s / MCMC sweep
 
-empirical cost ~ n^0.99        (theory n^1.00; dense DGP n^3)
+empirical cost ~ n^1.01        (theory n^1.00; dense DGP n^3)
 ```
 
 (two-layer DGP, m = 25, d = 2, on a 2-core box; see
@@ -151,7 +151,7 @@ examples/
   demo_scaling.py  timing vs n, fits the exponent
   demo_post_sample.py  sample paths, and a functional a band cannot give you
 tests/
-  test_vecdgp.py   36 tests
+  test_vecdgp.py   38 tests
 bench/
   ubench.cpp       C++/OpenMP transliteration of u_entries
   run_bench.py     races numba against it
@@ -162,7 +162,7 @@ bench/
 
 ## Correctness
 
-Run `pytest tests -q` (36 tests, ~30 s). The core idea: **when `m = n − 1` the
+Run `pytest tests -q` (38 tests, ~25 s). The core idea: **when `m = n − 1` the
 Vecchia approximation is exact**, so every approximated quantity must
 reproduce the dense-GP calculation to machine precision.
 
@@ -179,6 +179,9 @@ reproduce the dense-GP calculation to machine precision.
   covariance.
 - `cores` is a pure speed knob: predictions and sample paths are bit-identical
   for any core count, on all three model depths.
+- Every parallel path is exercised in a subprocess under numba's `workqueue`
+  threading layer, which aborts on nested parallelism where `omp`/`tbb` do
+  not — the configuration that broke macOS CI.
 - `post_sample` paths reproduce `predict(lite=False)`'s mean and full
   covariance (off-diagonal correlation > 0.95), and match exact MVN draws from
   that covariance on a statistic sensitive to joint structure — one that also
@@ -256,6 +259,21 @@ Anthropic ships in Anaconda, but not under the OpenBLAS in a pip numpy. Both
 factorisation for an SPD matrix and cannot reach that code path. Only the
 *log* determinant is ever formed.
 
+**`Fatal Python error: Aborted` during parallel prediction (macOS).** Fixed in
+0.3.1. Numba's `parallel=True` kernels must not be entered from several Python
+threads at once, and the draw-level thread pool did exactly that. The `omp`
+and `tbb` threading layers tolerate it; `workqueue` -- numba's fallback, and
+what a stock macOS install typically gets -- aborts the process with
+"Concurrent access has been detected". Every parallel kernel now has a serial
+twin, selected automatically inside the pool, so no nesting occurs on any
+layer. **If you run CI, exercise both layers** -- this passed on Linux for a
+release because `omp` happened to be available there:
+
+```bash
+pytest tests -q
+NUMBA_THREADING_LAYER=workqueue pytest tests -q
+```
+
 **Anything else calling `det`/`slogdet`/`inv` on a covariance.** Don't. Every
 covariance here is SPD, so Cholesky is always the right tool. The test suite
 now promotes numpy's divide-by-zero / overflow / invalid-value warnings to
@@ -294,8 +312,8 @@ end-to-end on a 2-core box, n = 4000:
 | | cores=1 | cores=2 | speedup |
 | --- | --- | --- | --- |
 | fit (s/sweep) | 0.634 | 0.321 | **1.97x** |
-| `predict()` | 1.41 s | 0.67 s | **2.10x** |
-| `post_sample()` | 2.79 s | 1.67 s | **1.67x** |
+| `predict()` | 0.69 s | 0.40 s | **1.70x** |
+| `post_sample()` | 1.83 s | 1.59 s | 1.15x |
 
 The two halves parallelise by different mechanisms, which is worth knowing:
 

@@ -10,6 +10,7 @@ known function.
 
 from __future__ import annotations
 
+import os
 import warnings
 
 import numpy as np
@@ -525,3 +526,66 @@ def test_wide_latent_layer():
     assert fit.w.shape == (150, 50, 3)
     p = fit.predict(rng.random((7, 2)), store_latent=True)
     assert p.w_new.shape == (150, 7, 3)
+
+
+# ---------------------------------------------------------------------------
+# threading-layer safety
+# ---------------------------------------------------------------------------
+def test_parallel_prediction_survives_the_workqueue_threading_layer(tmp_path):
+    """Guard against nested numba parallelism, which aborts the interpreter.
+
+    Numba's ``parallel=True`` kernels may not be entered from several Python
+    threads at once.  Under ``omp``/``tbb`` this is tolerated, but under
+    ``workqueue`` -- numba's fallback, and what a stock macOS install
+    typically gets -- it kills the process outright with "Concurrent access
+    has been detected".  That is why this shipped green on Linux and died on
+    macOS CI.
+
+    The layer is fixed at import, so this has to run in a subprocess.
+    """
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent("""
+        import numpy as np
+        from vecdgp import fit_two_layer, fit_three_layer
+        rng = np.random.default_rng(0)
+        x = rng.random((200, 2)); y = rng.standard_normal(200)
+        xp = rng.random((60, 2))
+        fit = fit_two_layer(x, y, nmcmc=41, true_g=1e-4, m=8,
+                            verb=False, seed=1).trim(21)
+        fit.predict(xp, cores=4)
+        fit.predict(xp[:25], lite=False, cores=4, rng=np.random.default_rng(2))
+        fit.post_sample(xp[:25], nper=2, cores=4, rng=np.random.default_rng(2))
+        f3 = fit_three_layer(x, y, nmcmc=21, true_g=1e-4, m=8,
+                             verb=False, seed=1).trim(11)
+        f3.predict(xp, cores=4)
+        print("OK")
+    """)
+    env = dict(os.environ, NUMBA_THREADING_LAYER="workqueue")
+    r = subprocess.run([sys.executable, "-c", script], capture_output=True,
+                       text=True, env=env, timeout=900)
+    assert r.returncode == 0, (
+        f"parallel prediction aborted under the workqueue threading layer "
+        f"(exit {r.returncode})\\nstdout: {r.stdout}\\nstderr: {r.stderr[-2000:]}"
+    )
+    assert "OK" in r.stdout
+
+
+def test_worker_flag_selects_the_serial_kernels():
+    """The dispatch itself, checkable on any threading layer."""
+    from vecdgp._compat import in_worker, in_worker_thread
+    from vecdgp.vecchia import create_U_values
+
+    rng = np.random.default_rng(0)
+    ap = create_approx(rng.random((80, 2)), m=12, rng=rng)
+
+    assert not in_worker()
+    parallel = create_U_values(ap, 1.0, 0.3, 1e-6, 2.5)
+    with in_worker_thread():
+        assert in_worker()
+        serial = create_U_values(ap, 1.0, 0.3, 1e-6, 2.5)
+    assert not in_worker(), "the flag must not leak out of the block"
+    # the two kernels must agree exactly, not merely approximately
+    assert np.array_equal(parallel, serial)
