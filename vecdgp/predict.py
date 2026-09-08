@@ -19,12 +19,17 @@ distribution instead (slower, wider intervals).
 
 from __future__ import annotations
 
+import os
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+
 import numpy as np
 
 from .krig import krig_vec
 from .vecchia import EPS
 
-__all__ = ["PredictResult", "predict_shallow_vec", "predict_deep_vec"]
+__all__ = ["PredictResult", "predict_shallow_vec", "predict_deep_vec",
+           "resolve_cores"]
 
 
 class PredictResult(dict):
@@ -62,10 +67,102 @@ def _g_at(g, t):
 
 
 # ---------------------------------------------------------------------------
+# parallelism over MCMC draws
+# ---------------------------------------------------------------------------
+def resolve_cores(cores):
+    """Interpret the ``cores`` argument; ``None`` or ``-1`` means all of them.
+
+    Capped by numba's hard thread maximum when numba is present, since
+    ``NUMBA_NUM_THREADS`` may sit below the machine's core count and numba
+    rejects any request above it.
+    """
+    avail = os.cpu_count() or 1
+    try:
+        from numba import config
+
+        avail = min(avail, config.NUMBA_NUM_THREADS)
+    except Exception:
+        pass
+    if cores is None or cores < 0:
+        return avail
+    return max(1, min(int(cores), avail))
+
+
+def _spawn(rng, k):
+    """``k`` independent generators, so a chunked run is still reproducible."""
+    try:
+        return rng.spawn(k)  # numpy >= 1.25
+    except AttributeError:  # pragma: no cover - older numpy
+        seeds = np.random.SeedSequence(rng.integers(2**63)).spawn(k)
+        return [np.random.default_rng(s) for s in seeds]
+
+
+def _chunks(nmcmc, cores):
+    """Contiguous draw ranges, one per worker."""
+    bounds = np.linspace(0, nmcmc, cores + 1).astype(int)
+    return [range(a, b) for a, b in zip(bounds[:-1], bounds[1:]) if b > a]
+
+
+@contextmanager
+def _numba_threads(n):
+    """Pin numba to ``n`` threads inside the block.
+
+    When the draw loop is spread over a thread pool, leaving numba's own
+    ``prange`` at full width would oversubscribe the machine several times
+    over.  Draws are the coarser and better axis -- they parallelise the
+    scipy KD-tree work too, which numba cannot touch -- so the inner width is
+    narrowed to match.
+    """
+    try:
+        from numba import get_num_threads, set_num_threads
+    except Exception:
+        yield
+        return
+    prev = get_num_threads()
+    try:
+        set_num_threads(max(1, min(n, prev)))
+        yield
+    finally:
+        set_num_threads(prev)
+
+
+def _run_draws(body, nmcmc, cores, rng):
+    """Apply ``body(t, rng, worker)`` for every draw, serially or across threads.
+
+    One generator is spawned **per draw**, not per worker, so the random
+    numbers consumed by draw ``t`` depend only on the seed and on ``t``.
+    That makes results bit-identical whatever ``cores`` is set to -- worth
+    the negligible spawn cost, since a parallel run that quietly returned
+    different numbers would be a nasty thing to debug.
+
+    ``body`` must be free of shared mutable state: callers hand each worker
+    its own copies of anything the draw loop writes to.
+    """
+    rngs = _spawn(rng, nmcmc)
+    if cores <= 1 or nmcmc < 2:
+        for t in range(nmcmc):
+            body(t, rngs[t], 0)
+        return
+
+    parts = _chunks(nmcmc, min(cores, nmcmc))
+
+    def work(args):
+        w, ts = args
+        for t in ts:
+            body(t, rngs[t], w)
+
+    inner = max(1, resolve_cores(None) // len(parts))
+    with _numba_threads(inner):
+        with ThreadPoolExecutor(max_workers=len(parts)) as ex:
+            list(ex.map(work, enumerate(parts)))
+
+
+# ---------------------------------------------------------------------------
 # one layer
 # ---------------------------------------------------------------------------
 def predict_shallow_vec(obj, x_new, m=None, lite=True, order_new=None,
-                        return_all=False, rng=None, samples_only=False, nper=1):
+                        return_all=False, rng=None, samples_only=False, nper=1,
+                        cores=1):
     rng = np.random.default_rng() if rng is None else rng
     x_new = _as2d(x_new)
     if x_new.shape[1] != obj.x.shape[1]:
@@ -89,22 +186,36 @@ def predict_shallow_vec(obj, x_new, m=None, lite=True, order_new=None,
     sigma_sum = np.zeros((n_new, n_new))
     s2_t = np.empty((obj.nmcmc, n_new)) if (lite and return_all) else None
 
-    for t in range(obj.nmcmc):
+    # `ap` is fully built before the loop and only read inside it, so the
+    # draws share it safely.
+    sig_parts = {}
+
+    def body(t, r, w):
         k = krig_vec(obj.y, ap, tau2=obj.tau2[t], theta=obj.theta[t],
                      g=_g_at(obj.g, t), v=obj.v, sep=sep,
                      s2=lite and not samples_only,
                      sigma=(not lite) and not samples_only,
-                     nsamples=nper if samples_only else 0, rng=rng)
+                     nsamples=nper if samples_only else 0, rng=r)
         if samples_only:
             samples[t * nper : (t + 1) * nper] = k["samples"]
-            continue
+            return
         mu_t[t] = k["mean"]
         if lite:
-            s2_sum += k["s2"]
-            if return_all:
-                s2_t[t] = k["s2"]
+            s2_t_all[t] = k["s2"]
         else:
-            sigma_sum += k["sigma"]
+            acc = sig_parts.get(w)
+            sig_parts[w] = k["sigma"] if acc is None else acc + k["sigma"]
+
+    s2_t_all = np.empty((obj.nmcmc, n_new)) if lite else None
+    _run_draws(body, obj.nmcmc, cores, rng)
+    if not samples_only:
+        if lite:
+            s2_sum = s2_t_all.sum(axis=0)
+            if return_all:
+                s2_t = s2_t_all
+        else:
+            for v in sig_parts.values():
+                sigma_sum += v
 
     if samples_only:
         return samples
@@ -116,7 +227,7 @@ def predict_shallow_vec(obj, x_new, m=None, lite=True, order_new=None,
 # ---------------------------------------------------------------------------
 def predict_deep_vec(obj, x_new, m=None, lite=True, mean_map=True,
                      store_latent=False, order_new=None, return_all=False,
-                     layers=2, rng=None, samples_only=False, nper=1):
+                     layers=2, rng=None, samples_only=False, nper=1, cores=1):
     rng = np.random.default_rng() if rng is None else rng
     x_new = _as2d(x_new)
     if x_new.shape[1] != obj.x.shape[1]:
@@ -147,8 +258,25 @@ def predict_deep_vec(obj, x_new, m=None, lite=True, mean_map=True,
         np.empty((obj.nmcmc, n_new, D)) if (store_latent and layers == 3) else None
     )
 
-    for t in range(obj.nmcmc):
+    # The draw loop rewrites w_approx (and z_approx) at every iteration, so
+    # each worker gets its own copy.  x_approx is finished above and only read
+    # here, so it stays shared.  The copies are shallow by design: every
+    # mutation in clean_pred / set_coords / add_pred rebinds an attribute to a
+    # fresh array rather than writing into an existing one, so the arrays that
+    # remain shared (order, rev_ord_obs, the training NN sets) are read-only.
+    nworkers = 1 if cores <= 1 else min(resolve_cores(cores), obj.nmcmc)
+    w_aps = [obj.w_approx if i == 0 else obj.w_approx.copy() for i in range(nworkers)]
+    z_aps = (
+        [obj.z_approx if i == 0 else obj.z_approx.copy() for i in range(nworkers)]
+        if layers == 3
+        else [None] * nworkers
+    )
+    s2_t_all = np.empty((obj.nmcmc, n_new)) if lite else None
+    sig_parts = {}
+
+    def body(t, r, w):
         g_t = _g_at(obj.g, t)
+        w_ap, z_ap = w_aps[w], z_aps[w]
 
         if layers == 3:
             z_t = obj.z[t]
@@ -156,21 +284,20 @@ def predict_deep_vec(obj, x_new, m=None, lite=True, mean_map=True,
             for i in range(D):
                 k = krig_vec(z_t[:, i], obj.x_approx, tau2=obj.settings.tau2_z,
                              theta=obj.theta_z[t, i], g=EPS, v=obj.v,
-                             nsamples=0 if mean_map else 1, rng=rng)
+                             nsamples=0 if mean_map else 1, rng=r)
                 z_new[:, i] = k["mean"] if mean_map else k["samples"][0]
-            obj.z_approx.clean_pred()
-            obj.z_approx.set_coords(z_t)
-            obj.z_approx.add_pred(z_new, m, lite=mean_map,
-                                  order_new=order_new, rng=rng)
+            z_ap.clean_pred()
+            z_ap.set_coords(z_t)
+            z_ap.add_pred(z_new, m, lite=mean_map, order_new=order_new, rng=r)
             if store_latent:
                 z_new_store[t] = z_new
 
             w_t = obj.w[t]
             w_new = np.empty((n_new, D))
             for i in range(D):
-                k = krig_vec(w_t[:, i], obj.z_approx, tau2=obj.settings.tau2_w,
+                k = krig_vec(w_t[:, i], z_ap, tau2=obj.settings.tau2_w,
                              theta=obj.theta_w[t, i], g=EPS, v=obj.v,
-                             nsamples=0 if mean_map else 1, rng=rng)
+                             nsamples=0 if mean_map else 1, rng=r)
                 w_new[:, i] = k["mean"] if mean_map else k["samples"][0]
         else:
             w_t = obj.w[t]
@@ -181,33 +308,41 @@ def predict_deep_vec(obj, x_new, m=None, lite=True, mean_map=True,
                 k = krig_vec(w_t[:, i], obj.x_approx, tau2=obj.settings.tau2_w,
                              theta=obj.theta_w[t, i], g=EPS, v=obj.v,
                              nsamples=0 if mean_map else 1,
-                             prior_mean=pm, prior_mean_new=pmn, rng=rng)
+                             prior_mean=pm, prior_mean_new=pmn, rng=r)
                 w_new[:, i] = k["mean"] if mean_map else k["samples"][0]
 
-        obj.w_approx.clean_pred()
-        obj.w_approx.set_coords(w_t)
-        obj.w_approx.add_pred(w_new, m, lite=lite, order_new=order_new, rng=rng)
+        w_ap.clean_pred()
+        w_ap.set_coords(w_t)
+        w_ap.add_pred(w_new, m, lite=lite, order_new=order_new, rng=r)
         if store_latent:
             w_new_store[t] = w_new
 
-        k = krig_vec(obj.y, obj.w_approx, tau2=obj.tau2_y[t],
+        k = krig_vec(obj.y, w_ap, tau2=obj.tau2_y[t],
                      theta=obj.theta_y[t], g=g_t, v=obj.v,
                      s2=lite and not samples_only,
                      sigma=(not lite) and not samples_only,
-                     nsamples=nper if samples_only else 0, rng=rng)
+                     nsamples=nper if samples_only else 0, rng=r)
         if samples_only:
             samples[t * nper : (t + 1) * nper] = k["samples"]
-            continue
+            return
         mu_t[t] = k["mean"]
         if lite:
-            s2_sum += k["s2"]
-            if return_all:
-                s2_t[t] = k["s2"]
+            s2_t_all[t] = k["s2"]
         else:
-            sigma_sum += k["sigma"]
+            acc = sig_parts.get(w)
+            sig_parts[w] = k["sigma"] if acc is None else acc + k["sigma"]
+
+    _run_draws(body, obj.nmcmc, cores, rng)
 
     if samples_only:
         return samples
+    if lite:
+        s2_sum = s2_t_all.sum(axis=0)
+        if return_all:
+            s2_t = s2_t_all
+    else:
+        for part in sig_parts.values():
+            sigma_sum += part
     out = _combine(mu_t, s2_sum, sigma_sum, obj.nmcmc, lite, return_all, s2_t)
     if store_latent:
         out["w_new"] = w_new_store

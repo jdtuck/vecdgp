@@ -11,6 +11,7 @@ priors are calibrated for that scaling.
 from __future__ import annotations
 
 import warnings
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from typing import Optional
 
@@ -23,7 +24,7 @@ from .gibbs import (
     init_latent,
 )
 from .kernels import EXP2
-from .predict import predict_deep_vec, predict_shallow_vec
+from .predict import predict_deep_vec, predict_shallow_vec, resolve_cores
 from .settings import Settings, default_settings
 from .vecchia import EPS, VecchiaApprox
 
@@ -35,6 +36,36 @@ __all__ = [
     "DGP2Vec",
     "DGP3Vec",
 ]
+
+
+@contextmanager
+def _use_cores(cores):
+    """Run the fit with numba pinned to ``cores`` threads.
+
+    MCMC sweeps are a Markov chain and cannot be parallelised, so the only
+    axis available during fitting is numba's own ``prange`` over the rows of
+    ``U``.  That parallelises almost perfectly (measured 1.99x on two cores),
+    which makes core count the strongest lever on fit time.
+    """
+    try:
+        from numba import config, get_num_threads, set_num_threads
+    except Exception:
+        yield resolve_cores(cores)
+        return
+    prev = get_num_threads()
+    if cores is None:
+        # respect whatever numba is already configured for (NUMBA_NUM_THREADS,
+        # a prior set_num_threads) rather than overriding the user
+        yield prev
+        return
+    # numba refuses anything above its hard maximum, which NUMBA_NUM_THREADS
+    # may have set below the machine's core count
+    n = max(1, min(resolve_cores(cores), config.NUMBA_NUM_THREADS))
+    try:
+        set_num_threads(n)
+        yield n
+    finally:
+        set_num_threads(prev)
 
 
 def _as2d(x):
@@ -111,12 +142,14 @@ class GPVec(_BaseFit):
         return out
 
     def predict(self, x_new, m=None, lite=True, order_new=None,
-                return_all=False, rng=None):
+                return_all=False, rng=None, cores=None):
         return predict_shallow_vec(self, x_new, m=m, lite=lite,
                                    order_new=order_new,
-                                   return_all=return_all, rng=rng)
+                                   return_all=return_all, rng=rng,
+                                   cores=resolve_cores(cores))
 
-    def post_sample(self, x_new, nper=1, m=None, order_new=None, rng=None):
+    def post_sample(self, x_new, nper=1, m=None, order_new=None, rng=None,
+                    cores=None):
         """Draw joint posterior sample paths at ``x_new``.
 
         Unlike ``predict``, which returns summarised moments, this returns
@@ -148,7 +181,8 @@ class GPVec(_BaseFit):
         ndarray, shape ``(nper * nmcmc, len(x_new))``
         """
         return predict_shallow_vec(self, x_new, m=m, order_new=order_new,
-                                   rng=rng, samples_only=True, nper=nper)
+                                   rng=rng, samples_only=True, nper=nper,
+                                   cores=resolve_cores(cores))
 
 
 @dataclass
@@ -176,13 +210,15 @@ class DGP2Vec(_BaseFit):
         return out
 
     def predict(self, x_new, m=None, lite=True, mean_map=True,
-                store_latent=False, order_new=None, return_all=False, rng=None):
+                store_latent=False, order_new=None, return_all=False, rng=None,
+                cores=None):
         return predict_deep_vec(self, x_new, m=m, lite=lite, mean_map=mean_map,
                                 store_latent=store_latent, order_new=order_new,
-                                return_all=return_all, layers=2, rng=rng)
+                                return_all=return_all, layers=2, rng=rng,
+                                cores=resolve_cores(cores))
 
     def post_sample(self, x_new, nper=1, m=None, mean_map=True,
-                    order_new=None, rng=None):
+                    order_new=None, rng=None, cores=None):
         """Draw joint posterior sample paths at ``x_new``.
 
         See :meth:`GPVec.post_sample`.  ``mean_map=False`` additionally
@@ -196,7 +232,8 @@ class DGP2Vec(_BaseFit):
         """
         return predict_deep_vec(self, x_new, m=m, mean_map=mean_map,
                                 order_new=order_new, rng=rng, layers=2,
-                                samples_only=True, nper=nper)
+                                samples_only=True, nper=nper,
+                                cores=resolve_cores(cores))
 
 
 @dataclass
@@ -229,13 +266,15 @@ class DGP3Vec(_BaseFit):
         return out
 
     def predict(self, x_new, m=None, lite=True, mean_map=True,
-                store_latent=False, order_new=None, return_all=False, rng=None):
+                store_latent=False, order_new=None, return_all=False, rng=None,
+                cores=None):
         return predict_deep_vec(self, x_new, m=m, lite=lite, mean_map=mean_map,
                                 store_latent=store_latent, order_new=order_new,
-                                return_all=return_all, layers=3, rng=rng)
+                                return_all=return_all, layers=3, rng=rng,
+                                cores=resolve_cores(cores))
 
     def post_sample(self, x_new, nper=1, m=None, mean_map=True,
-                    order_new=None, rng=None):
+                    order_new=None, rng=None, cores=None):
         """Draw joint posterior sample paths at ``x_new``.
 
         See :meth:`GPVec.post_sample`.  ``mean_map=False`` additionally
@@ -249,7 +288,8 @@ class DGP3Vec(_BaseFit):
         """
         return predict_deep_vec(self, x_new, m=m, mean_map=mean_map,
                                 order_new=order_new, rng=rng, layers=3,
-                                samples_only=True, nper=nper)
+                                samples_only=True, nper=nper,
+                                cores=resolve_cores(cores))
 
 
 # ---------------------------------------------------------------------------
@@ -257,7 +297,7 @@ class DGP3Vec(_BaseFit):
 # ---------------------------------------------------------------------------
 def fit_one_layer(x, y, nmcmc=10000, sep=False, verb=True, theta_0=0.01,
                   g_0=0.001, true_g=None, v=2.5, settings=None, cov="matern",
-                  m=None, order=None, seed=None, rng=None):
+                  m=None, order=None, seed=None, rng=None, cores=None):
     """MCMC sampling for a one-layer (Vecchia-approximated) GP.
 
     Parameters
@@ -302,8 +342,9 @@ def fit_one_layer(x, y, nmcmc=10000, sep=False, verb=True, theta_0=0.01,
     theta_0 = np.repeat(theta_0, d) if sep and np.ndim(theta_0) == 0 else theta_0
     initial = {"theta": theta_0, "g": g_0}
 
-    out = gibbs_one_layer_vec(x, y, nmcmc, verb, initial, true_g, st, v, m,
-                              order=order, rng=rng)
+    with _use_cores(cores):
+        out = gibbs_one_layer_vec(x, y, nmcmc, verb, initial, true_g, st, v, m,
+                                  order=order, rng=rng)
     return GPVec(x=x, y=y, nmcmc=nmcmc, settings=st, v=v, m=m, ll=out["ll"],
                  time=time.time() - tic, g=out["g"], theta=out["theta"],
                  tau2=out["tau2"], x_approx=out["x_approx"])
@@ -312,7 +353,7 @@ def fit_one_layer(x, y, nmcmc=10000, sep=False, verb=True, theta_0=0.01,
 def fit_two_layer(x, y, nmcmc=10000, D=None, pmx=False, verb=True, w_0=None,
                   theta_y_0=0.01, theta_w_0=0.1, g_0=0.001, true_g=None,
                   v=2.5, settings=None, cov="matern", m=None, order=None,
-                  seed=None, rng=None):
+                  seed=None, rng=None, cores=None):
     """MCMC sampling for a two-layer deep GP with the Vecchia approximation.
 
     ``D`` is the width of the latent layer (defaults to ``ncol(x)``).  The
@@ -348,8 +389,9 @@ def fit_two_layer(x, y, nmcmc=10000, D=None, pmx=False, verb=True, w_0=None,
     )
     initial = {"w": w0, "theta_y": theta_y_0, "theta_w": theta_w_0, "g": g_0}
 
-    out = gibbs_two_layer_vec(x, y, nmcmc, D, verb, initial, true_g, st, v, m,
-                              order=order, rng=rng)
+    with _use_cores(cores):
+        out = gibbs_two_layer_vec(x, y, nmcmc, D, verb, initial, true_g, st, v, m,
+                                  order=order, rng=rng)
     return DGP2Vec(x=x, y=y, nmcmc=nmcmc, settings=st, v=v, m=m, ll=out["ll"],
                    time=time.time() - tic, g=out["g"], theta_y=out["theta_y"],
                    theta_w=out["theta_w"], tau2_y=out["tau2_y"], w=out["w"],
@@ -359,7 +401,7 @@ def fit_two_layer(x, y, nmcmc=10000, D=None, pmx=False, verb=True, w_0=None,
 def fit_three_layer(x, y, nmcmc=10000, D=None, verb=True, w_0=None, z_0=None,
                     theta_y_0=0.01, theta_w_0=0.1, theta_z_0=0.1, g_0=0.001,
                     true_g=None, v=2.5, settings=None, cov="matern", m=None,
-                    order=None, seed=None, rng=None):
+                    order=None, seed=None, rng=None, cores=None):
     """MCMC sampling for a three-layer deep GP with the Vecchia approximation."""
     import time
 
@@ -389,8 +431,9 @@ def fit_three_layer(x, y, nmcmc=10000, D=None, verb=True, w_0=None, z_0=None,
     initial = {"w": w0, "z": z0, "theta_y": theta_y_0, "theta_w": theta_w_0,
                "theta_z": theta_z_0, "g": g_0}
 
-    out = gibbs_three_layer_vec(x, y, nmcmc, D, verb, initial, true_g, st, v, m,
-                                order=order, rng=rng)
+    with _use_cores(cores):
+        out = gibbs_three_layer_vec(x, y, nmcmc, D, verb, initial, true_g, st, v, m,
+                                    order=order, rng=rng)
     return DGP3Vec(x=x, y=y, nmcmc=nmcmc, settings=st, v=v, m=m, ll=out["ll"],
                    time=time.time() - tic, g=out["g"], theta_y=out["theta_y"],
                    theta_w=out["theta_w"], theta_z=out["theta_z"],

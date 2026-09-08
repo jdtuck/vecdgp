@@ -45,7 +45,7 @@ __all__ = ["krig_vec"]
 # ---------------------------------------------------------------------------
 # point-wise ("lite") prediction
 # ---------------------------------------------------------------------------
-@njit(cache=True, parallel=True)
+@njit(cache=True, parallel=True, nogil=True)
 def _krig_lite(x_ord, x_new, NN_new, yo, tau2, theta, g, v, sep, want_s2):
     n_new = x_new.shape[0]
     d = x_new.shape[1]
@@ -97,7 +97,7 @@ def _krig_lite(x_ord, x_new, NN_new, yo, tau2, theta, g, v, sep, want_s2):
 # ---------------------------------------------------------------------------
 # sequential posterior sampling
 # ---------------------------------------------------------------------------
-@njit(cache=True)
+@njit(cache=True, nogil=True)
 def _krig_samples(x_ord, NN, NN_len, yo, z_norm, tau2, theta, g, v, sep, n_obs):
     """Sequential draws at the appended predictive locations.
 

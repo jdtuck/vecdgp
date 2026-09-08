@@ -396,6 +396,66 @@ def test_post_sample_is_available_on_every_model(booth_data):
         assert np.all(np.isfinite(paths))
 
 
+# ---------------------------------------------------------------------------
+# parallelism over MCMC draws
+# ---------------------------------------------------------------------------
+def test_cores_does_not_change_results(booth_data):
+    """`cores` must be a pure speed knob.
+
+    One generator is spawned per draw rather than per worker, so the numbers
+    consumed by draw t depend only on the seed and t.  A parallel run that
+    quietly returned different answers would be a horrible thing to debug, so
+    every path is pinned here -- including the stochastic ones.
+    """
+    x, y, xp, _ = booth_data
+    fit = fit_two_layer(x, y, nmcmc=400, true_g=1e-6, verb=False, seed=1,
+                        m=10).trim(200, 2)
+
+    def both(fn):
+        return fn(1), fn(4)
+
+    a, b = both(lambda c: fit.predict(xp, rng=np.random.default_rng(9), cores=c))
+    assert np.array_equal(a.mean, b.mean)
+    assert np.array_equal(a.s2, b.s2)
+
+    a, b = both(lambda c: fit.predict(xp[:40], lite=False,
+                                      rng=np.random.default_rng(9), cores=c))
+    assert np.abs(a.mean - b.mean).max() < 1e-12
+    assert np.abs(a.Sigma - b.Sigma).max() < 1e-12  # summation order only
+
+    a, b = both(lambda c: fit.post_sample(xp[:40], nper=3,
+                                          rng=np.random.default_rng(9), cores=c))
+    assert np.array_equal(a, b)
+
+
+def test_cores_independence_for_three_layer(booth_data):
+    x, y, xp, _ = booth_data
+    fit = fit_three_layer(x, y, nmcmc=200, true_g=1e-6, verb=False, seed=2,
+                          m=8).trim(100, 2)
+    a = fit.predict(xp, rng=np.random.default_rng(3), cores=1)
+    b = fit.predict(xp, rng=np.random.default_rng(3), cores=4)
+    assert np.array_equal(a.mean, b.mean)
+    assert np.array_equal(a.s2, b.s2)
+
+
+def test_resolve_cores_respects_numba_limit():
+    """Asking for more threads than numba allows must clamp, not raise."""
+    from vecdgp.predict import resolve_cores
+
+    assert resolve_cores(1) == 1
+    assert resolve_cores(None) >= 1
+    assert resolve_cores(-1) >= 1
+    assert resolve_cores(10_000) == resolve_cores(None)  # capped at what exists
+    # a fit must survive an over-large request rather than erroring
+    rng = np.random.default_rng(5)
+    x = rng.random((40, 1))
+    y = np.sin(6 * x.ravel())
+    y = (y - y.mean()) / y.std()
+    fit = fit_one_layer(x, y, nmcmc=40, true_g=1e-6, verb=False, seed=0, m=8,
+                        cores=10_000)
+    assert fit.nmcmc == 40
+
+
 def test_two_layer_beats_one_layer_on_a_nonstationary_function(booth_data):
     x, y, xp, yp = booth_data
     gp = fit_one_layer(x, y, nmcmc=2000, true_g=1e-6, verb=False, seed=1,

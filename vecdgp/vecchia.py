@@ -139,7 +139,7 @@ def _u_column(pts, n0, tau2, theta, g, v, sep, cov, out):
         out[k] = m[last - k]
 
 
-@njit(cache=True, parallel=True)
+@njit(cache=True, parallel=True, nogil=True)
 def u_entries(x_ord, NN, NN_len, tau2, theta, g, v, sep):
     """Entries of the sparse upper-triangular Cholesky factor ``U``.
 
@@ -165,7 +165,7 @@ def u_entries(x_ord, NN, NN_len, tau2, theta, g, v, sep):
     return Uvals
 
 
-@njit(cache=True)
+@njit(cache=True, nogil=True)
 def forward_solve_ut(Uvals, NN, NN_len, z):
     """Solve ``U^T y = z`` by forward substitution (``U^T`` is lower)."""
     n = z.shape[0]
@@ -178,7 +178,7 @@ def forward_solve_ut(Uvals, NN, NN_len, z):
     return y
 
 
-@njit(cache=True, parallel=True)
+@njit(cache=True, parallel=True, nogil=True)
 def ut_mult(Uvals, NN, NN_len, vvec):
     """Compute ``U^T v`` exploiting the sparsity pattern."""
     n = vvec.shape[0]

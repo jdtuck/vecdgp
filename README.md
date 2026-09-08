@@ -151,16 +151,18 @@ examples/
   demo_scaling.py  timing vs n, fits the exponent
   demo_post_sample.py  sample paths, and a functional a band cannot give you
 tests/
-  test_vecdgp.py   33 tests
+  test_vecdgp.py   36 tests
 bench/
   ubench.cpp       C++/OpenMP transliteration of u_entries
   run_bench.py     races numba against it
   opt_numba.py     isolates the two loop-shape optimisations
+  opt_uentries.py  tests whether hoisting per-row allocations pays (it does not)
+  scaling_cores.py measures core scaling on your machine
 ```
 
 ## Correctness
 
-Run `pytest tests -q` (33 tests, ~20 s). The core idea: **when `m = n − 1` the
+Run `pytest tests -q` (36 tests, ~30 s). The core idea: **when `m = n − 1` the
 Vecchia approximation is exact**, so every approximated quantity must
 reproduce the dense-GP calculation to machine precision.
 
@@ -175,6 +177,8 @@ reproduce the dense-GP calculation to machine precision.
   variances at full `m`, and agree with each other.
 - 30 000 sequential posterior samples reproduce the joint predictive mean and
   covariance.
+- `cores` is a pure speed knob: predictions and sample paths are bit-identical
+  for any core count, on all three model depths.
 - `post_sample` paths reproduce `predict(lite=False)`'s mean and full
   covariance (off-diagonal correlation > 0.95), and match exact MVN draws from
   that covariance on a statistic sensitive to joint structure — one that also
@@ -273,23 +277,55 @@ numba every kernel falls back to interpreted loops.
 Measured at **n = 6000, d = 2, m = 25, two-layer, on a 2-core box**. Start with
 `python -m vecdgp.diagnose`, which reports your thread count.
 
-**1. Check your core count first.** Cost is essentially linear in cores — the
-row loop over `U` is embarrassingly parallel:
+**1. Use your cores — there is now a `cores` argument everywhere.**
 
-| threads | s/sweep | nmcmc = 10 000 |
-| --- | --- | --- |
-| 1 | 1.068 | 2.97 h |
-| 2 | 0.536 | 1.49 h |
+```python
+fit   = fit_two_layer(x, y, nmcmc=10000, cores=16)   # numba threads
+pred  = fit.predict(xp, cores=16)                    # + parallel over draws
+paths = fit.post_sample(xp, cores=16)
+```
 
-That's 1.99x from one extra core. This box only has 2; on 16 you should expect
-roughly 0.07 s/sweep (~11 min). A numba install that silently ends up
-single-threaded is the most common cause of an unexpectedly slow fit, so
-`fit_*(verb=True)` now prints the thread count and a running ETA:
+`cores=None` (the default for prediction) uses everything available;
+`cores=1` forces serial. **Results do not depend on `cores`** — one RNG
+stream is spawned per MCMC draw rather than per worker, so every path is
+bit-identical however you set it (there are tests pinning this). Measured
+end-to-end on a 2-core box, n = 4000:
+
+| | cores=1 | cores=2 | speedup |
+| --- | --- | --- | --- |
+| fit (s/sweep) | 0.634 | 0.321 | **1.97x** |
+| `predict()` | 1.41 s | 0.67 s | **2.10x** |
+| `post_sample()` | 2.79 s | 1.67 s | **1.67x** |
+
+The two halves parallelise by different mechanisms, which is worth knowing:
+
+- **Fitting** can only use numba's `prange` over the rows of `U` — MCMC
+  sweeps are a Markov chain and cannot be split. That parallelises almost
+  perfectly, so fit time is close to inversely proportional to core count.
+- **Prediction** adds a second, coarser axis: MCMC draws are independent, so
+  they are spread over a thread pool. This matters because much of prediction
+  is scipy KD-tree work and the sequential sampler, which `prange` cannot
+  reach at all — numba threads alone take `post_sample` only 1.25x, and draw
+  parallelism carries it the rest of the way to 1.67x.
+
+Measure it on your own hardware — this box only has two cores, so the ladder
+above is a floor, not a projection:
+
+```bash
+python bench/scaling_cores.py            # n=6000, d=2, m=25
+python bench/scaling_cores.py 20000 3    # your own size
+```
+
+`fit_*(verb=True)` prints the live thread count and an ETA:
 
 ```
-  mcmc on 2 threads
-  mcmc 100/10000  0.536 s/sweep  elapsed 54s  eta 1h28m
+  mcmc on 16 threads
+  mcmc 100/10000  0.041 s/sweep  elapsed 4s  eta 6m48s
 ```
+
+A numba install that silently ends up single-threaded is the most common
+cause of an unexpectedly slow fit; `python -m vecdgp.diagnose` reports the
+thread count it actually gets.
 
 **2. `m` is the strongest knob you control.** Cost is `O(n m³)`, so it bites
 hard:

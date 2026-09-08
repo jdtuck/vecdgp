@@ -138,7 +138,7 @@ def _apply_kernel(out, n1, n2, tau2, v, lower_only):
     return out
 
 
-@njit(cache=True)
+@njit(cache=True, nogil=True)
 def fill_cov(out, x1, x2, tau2, theta, g, v, sep, add_nugget):
     """Fill ``out`` with the full ``tau2 * (k(...) + g I)``.
 
@@ -155,7 +155,7 @@ def fill_cov(out, x1, x2, tau2, theta, g, v, sep, add_nugget):
     return out
 
 
-@njit(cache=True)
+@njit(cache=True, nogil=True)
 def fill_cov_sym(out, x, n, tau2, theta, g, v, sep):
     """Fill only the **lower triangle** of the square covariance of ``x``.
 
