@@ -55,6 +55,7 @@ from .vecchia import (
     find_ordered_nn,
     rand_mvn_vec,
 )
+from .vecdgp4mvBayes import vecdgp4mvBayes, MvBayesVecDGPWrapper
 
 __version__ = "0.3.3"
 
@@ -84,6 +85,8 @@ __all__ = [
     "Settings",
     "default_settings",
     "EPS",
+    "vecdgp4mvBayes",
+    "MvBayesVecDGPWrapper",
     "EXP2",
     "HAVE_NUMBA",
     "__version__",
