@@ -151,13 +151,21 @@ def _krig_samples(x_ord, NN, NN_len, yo, z_norm, tau2, theta, g, v, sep, n_obs):
             for c in range(n0):
                 trace += K[c, c]
             jit = 1e-10 * trace / n0
-            for _ in range(10):
+            ok = False
+            for _ in range(12):
                 fill_cov_sym(K, pts, n0, 1.0, theta, g, v, sep)
                 for c in range(n0):
                     K[c, c] += jit
                 if _chol_lower(K, n0) == 0:
+                    ok = True
                     break
                 jit *= 10.0
+            if not ok:
+                raise ValueError(
+                    "post_sample: conditioning block not positive definite "
+                    "even with jitter; check theta/tau2/g for non-finite "
+                    "values"
+                )
         sd = np.sqrt(tau2) * K[ncond, ncond]
 
         for s in range(nsamples):
@@ -180,6 +188,22 @@ def _krig_samples(x_ord, NN, NN_len, yo, z_norm, tau2, theta, g, v, sep, n_obs):
 # ---------------------------------------------------------------------------
 # driver
 # ---------------------------------------------------------------------------
+def _check_finite(theta, tau2, g):
+    """Reject non-finite hyperparameters at the boundary.
+
+    ``tau2`` never enters the Cholesky -- it only scales the draw -- so a NaN
+    there would sail past the factorisation's own guard and come back as a
+    NaN sample.  Three scalars against a call that costs hundreds of
+    microseconds; the check is free and the alternative is silent corruption.
+    """
+    if not np.all(np.isfinite(theta)):
+        raise ValueError("non-finite lengthscale (theta) passed to prediction")
+    if not np.isfinite(tau2) or tau2 < 0.0:
+        raise ValueError("tau2 must be finite and non-negative")
+    if not np.isfinite(g) or g < 0.0:
+        raise ValueError("nugget (g) must be finite and non-negative")
+
+
 def krig_vec(y, approx, tau2=1.0, theta=0.1, g=0.0, v=2.5, sep=False,
              s2=False, sigma=False, nsamples=0, prior_mean=0.0,
              prior_mean_new=0.0, rng=None):
@@ -189,6 +213,7 @@ def krig_vec(y, approx, tau2=1.0, theta=0.1, g=0.0, v=2.5, sep=False,
     """
     y = np.asarray(y, dtype=np.float64)
     th = _theta_vec(theta, approx.x_ord.shape[1], sep)
+    _check_finite(th, tau2, g)
     out = {}
 
     pm = np.asarray(prior_mean, dtype=np.float64)

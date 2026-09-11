@@ -86,12 +86,19 @@ __all__ = [
 # ---------------------------------------------------------------------------
 @njit(cache=True)
 def _chol_lower(A, n):
-    """In-place lower Cholesky. Returns 0 on success, 1 if not PD."""
+    """In-place lower Cholesky. Returns 0 on success, 1 if not PD.
+
+    The pivot test is written ``not (s > 0)`` rather than ``s <= 0`` so that a
+    NaN pivot reports failure.  ``nan <= 0`` is false, which would otherwise
+    let a non-finite covariance through as a silently NaN factor -- and every
+    caller here treats a nonzero return as "fall back", so the difference is
+    between a diagnosed failure and quiet garbage downstream.
+    """
     for j in range(n):
         s = A[j, j]
         for k in range(j):
             s -= A[j, k] * A[j, k]
-        if s <= 0.0:
+        if not (s > 0.0):
             return 1
         A[j, j] = np.sqrt(s)
         for i in range(j + 1, n):
@@ -119,13 +126,24 @@ def _u_column(pts, n0, tau2, theta, g, v, sep, cov, out):
         for k in range(n0):
             trace += cov[k, k]
         jit = 1e-10 * trace / n0
-        for _ in range(10):
+        ok = False
+        for _ in range(12):
             fill_cov_sym(cov, pts, n0, tau2, theta, g, v, sep)
             for k in range(n0):
                 cov[k, k] += jit
             if _chol_lower(cov, n0) == 0:
+                ok = True
                 break
             jit *= 10.0
+        if not ok:
+            # jitter reaching 1% of the trace and still failing means the
+            # inputs are bad (a non-finite theta or tau2), not that the block
+            # is merely ill-conditioned.  Better to say so than to return a
+            # factor full of NaN that quietly poisons the likelihood.
+            raise ValueError(
+                "Vecchia: conditioning block not positive definite even with "
+                "jitter; check theta/tau2/g for non-finite values"
+            )
 
     # back-substitution for M = R^{-1} e_{n0-1}, R = L^T so R[k, j] = L[j, k]
     last = n0 - 1

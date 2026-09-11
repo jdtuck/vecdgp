@@ -34,7 +34,7 @@ from vecdgp import (
     rmse,
     score,
 )
-from vecdgp.vecchia import forward_solve_ut, ut_mult
+from vecdgp.vecchia import _chol_lower, forward_solve_ut, ut_mult
 
 V_CASES = [0.5, 1.5, 2.5, 999.0]
 
@@ -835,3 +835,35 @@ def test_sampler_draw_index_wraps_and_validates(booth_data):
     assert np.array_equal(a, b)
     with pytest.raises(ValueError):
         emu.sample(np.zeros((1, 5)), draw=0)  # wrong input dimension
+
+
+def test_nonfinite_parameters_raise_instead_of_returning_nan(booth_data):
+    """A bad parameter must be reported, not silently propagated as NaN.
+
+    ``_chol_lower``'s pivot test decides this: ``nan <= 0`` is false, so a
+    NaN covariance used to sail through as a NaN factor, and the jitter
+    fallbacks then used whatever the failed factorisation left behind. In a
+    calibration loop -- one draw per outer iteration, a hundred thousand
+    iterations -- that corrupts the posterior with nothing in the log.
+    """
+    x, y, xp, _ = booth_data
+    fit = fit_two_layer(x, y, nmcmc=200, true_g=1e-6, verb=False, seed=7,
+                        m=8).trim(100, 2)
+
+    # the pivot test itself
+    A = np.array([[np.nan, 0.0], [0.0, 1.0]])
+    assert _chol_lower(A, 2) == 1, "a NaN pivot must report failure"
+    B = np.array([[1.0, 0.0], [0.0, 1.0]])
+    assert _chol_lower(B, 2) == 0
+
+    # and the samplers that rely on it
+    for attr in ("tau2_y", "theta_y"):
+        broken = fit.select(None)
+        setattr(broken, attr, np.asarray(getattr(broken, attr), float).copy())
+        getattr(broken, attr)[0] = np.nan
+        with pytest.raises(ValueError, match="finite|positive definite"):
+            broken.post_sample(xp[:3], draws=0, cores=1,
+                               rng=np.random.default_rng(0))
+        with pytest.raises(ValueError, match="finite|positive definite"):
+            broken.sampler().sample(xp[:1], draw=0,
+                                    rng=np.random.default_rng(0))

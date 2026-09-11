@@ -35,7 +35,7 @@ import numpy as np
 
 from ._compat import njit
 from .kernels import _theta_vec, fill_cov_sym
-from .krig import _krig_lite_serial
+from .krig import _check_finite, _krig_lite_serial
 from .vecchia import EPS, _build_tree, _chol_lower
 
 __all__ = ["PosteriorSampler"]
@@ -87,13 +87,24 @@ def _sample_appended(x_train, y_train, x_new, cond, cond_len, tau2, theta, g,
                 for c in range(n0):
                     trace += K[c, c]
                 jit = 1e-10 * trace / n0
-                for _ in range(10):
+                ok = False
+                for _ in range(12):
                     fill_cov_sym(K, pts, n0, 1.0, theta, g, v, sep)
                     for c in range(n0):
                         K[c, c] += jit
                     if _chol_lower(K, n0) == 0:
+                        ok = True
                         break
                     jit *= 10.0
+                if not ok:
+                    # this one runs 100k times inside a calibration loop, so a
+                    # silent NaN would corrupt the outer posterior with nothing
+                    # to show for it
+                    raise ValueError(
+                        "sampler: conditioning block not positive definite "
+                        "even with jitter; check theta/tau2/g for non-finite "
+                        "values"
+                    )
 
             a = np.empty(nc)
             for r in range(nc):
@@ -272,6 +283,7 @@ class PosteriorSampler:
 
         tau2 = float(fit.tau2_y[t] if self.layers > 1 else fit.tau2[t])
         theta = fit.theta_y[t] if self.layers > 1 else fit.theta[t]
+        _check_finite(theta, tau2, self._g_at(t))
         z = rng.standard_normal((nper, x_new.shape[0]))
         return _sample_appended(
             st.w_ord, self.y_ord, w_new, cond, clen, tau2,
@@ -294,6 +306,7 @@ class PosteriorSampler:
         nn = np.atleast_2d(np.asarray(st.tree.query(w_new, k=m)[1], np.int64))
         tau2 = float(fit.tau2_y[t] if self.layers > 1 else fit.tau2[t])
         theta = fit.theta_y[t] if self.layers > 1 else fit.theta[t]
+        _check_finite(theta, tau2, self._g_at(t))
         mu, s2 = _krig_lite_serial(
             st.w_ord, w_new, nn, self.y_ord, tau2,
             _theta_vec(theta, st.w_ord.shape[1], self.sep),

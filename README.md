@@ -91,6 +91,71 @@ fit <- trim(fit, 5000, 5)
 p   <- predict(fit, xp, lite = TRUE)
 ```
 
+## One sample at a time
+
+Calibration is the other shape entirely: one location, one sample, a hundred
+thousand times. `post_sample` is built for many locations and every retained
+draw at once, and at that size nearly all of its time goes on per-call setup
+over the *training* set — a KD-tree over all `n` points, re-ordering the latent
+layer, allocating `(n, m+1)` conditioning arrays. None of it depends on the
+point being evaluated, so `fit.sampler()` hoists it out and memoises it per
+posterior draw:
+
+```python
+emu = fit.sampler()
+rng = np.random.default_rng(0)
+for step in range(100_000):
+    t = rng.integers(emu.nmcmc)              # new posterior draw each step
+    y = emu.sample(theta_proposed, draw=t, rng=rng)   # (1, 1)
+    ...                                      # accept/reject on y
+```
+
+Holding `t` fixed gives a plug-in emulator instead — cheaper in variance, but
+the calibration posterior is then conditional on one emulator fit rather than
+integrating over emulator uncertainty. That is a statistical choice, not a
+performance one: the two cost the same (see the table below).
+
+`emu.mean_sd(x, draw=t)` returns the moments without drawing, for a plug-in
+likelihood. It is bit-identical to `predict(x, draws=t)`, which is the point —
+this is the same calculation, not a cheaper approximation.
+
+n = 6000, d = 2, m = 25, one location, a fresh posterior draw each iteration
+(`bench/calibration.py`):
+
+| route | µs/evaluation | ×100k iterations |
+|---|---|---|
+| `post_sample()` — all draws, keep one | 100 000 | 2.8 h |
+| `post_sample(draws=t)` | 3 678 | 6.1 min |
+| `emu.sample(draw=t)` | 312 | 31 s |
+
+Two counts matter, and they behave differently:
+
+**Samples per call (`nper`).** The setup is paid once however many you ask
+for, so cost per sample falls to a floor — that floor is what the sequential
+draw alone costs.
+
+| `nper` | 1 | 10 | 100 | 1 000 | 10 000 |
+|---|---|---|---|---|---|
+| µs/sample | 286 | 68 | 43 | 41 | 38 |
+
+So ~275 µs of a single-sample call is setup and ~38 µs is the draw. If your
+outer loop can batch — several proposals at once, or several emulator
+replicates per proposal — it is nearly free to do so.
+
+**Posterior draws visited.** Warm, the per-evaluation cost is flat at
+~280–290 µs whether the loop revisits one draw or all forty, because the only
+per-draw work is a KD-tree built the first time that draw is seen. Warming all
+40 draws costs 71 ms once, or 0.71 µs/iteration amortised over 100k. Being
+fully Bayesian about the emulator is free here.
+
+The cache holds one KD-tree per visited draw (a few hundred kB each at
+n = 6000); `fit.sampler(max_cached=...)` bounds it, evicting first-in.
+
+```bash
+python bench/calibration.py              # n=6000, d=2, m=25
+python bench/calibration.py 20000 2 25   # your own size
+```
+
 ## What the method does
 
 **Vecchia approximation.** Order the observations at random (Guinness 2018) and
@@ -141,6 +206,7 @@ vecdgp/
   mcmc.py       Vecchia log-likelihood, MH samplers, elliptical slice sampling
   gibbs.py      the 1-/2-/3-layer Gibbs sweeps
   krig.py       point-wise, joint, and sequential-sample prediction
+  calibrate.py  cached per-draw sampler for one-location repeated draws
   predict.py    averaging over MCMC draws, latent-layer mapping
   fit.py        fit_one_layer / fit_two_layer / fit_three_layer, trim, predict, post_sample
   settings.py   deepgp's default priors and proposal windows
@@ -151,18 +217,19 @@ examples/
   demo_scaling.py  timing vs n, fits the exponent
   demo_post_sample.py  sample paths, and a functional a band cannot give you
 tests/
-  test_vecdgp.py   40 tests
+  test_vecdgp.py   53 tests
 bench/
   ubench.cpp       C++/OpenMP transliteration of u_entries
   run_bench.py     races numba against it
   opt_numba.py     isolates the two loop-shape optimisations
   opt_uentries.py  tests whether hoisting per-row allocations pays (it does not)
   scaling_cores.py measures core scaling on your machine
+  calibration.py   per-evaluation latency for the one-sample-at-a-time loop
 ```
 
 ## Correctness
 
-Run `pytest tests -q` (40 tests, ~30 s). The core idea: **when `m = n − 1` the
+Run `pytest tests -q` (53 tests, ~30 s). The core idea: **when `m = n − 1` the
 Vecchia approximation is exact**, so every approximated quantity must
 reproduce the dense-GP calculation to machine precision.
 

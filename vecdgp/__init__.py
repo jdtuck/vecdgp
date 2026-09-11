@@ -57,7 +57,7 @@ from .vecchia import (
 )
 from .vecdgp4mvBayes import vecdgp4mvBayes, MvBayesVecDGPWrapper
 
-__version__ = "0.3.3"
+__version__ = "0.5.1"
 
 __all__ = [
     "fit_one_layer",
