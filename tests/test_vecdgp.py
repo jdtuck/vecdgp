@@ -589,3 +589,68 @@ def test_worker_flag_selects_the_serial_kernels():
     assert not in_worker(), "the flag must not leak out of the block"
     # the two kernels must agree exactly, not merely approximately
     assert np.array_equal(parallel, serial)
+
+
+def test_axis_selection_does_not_collapse_on_many_core_machines():
+    """With more cores than draws, only the useful axis may be chosen.
+
+    ``post_sample``'s sampler is sequential over test locations, so it has no
+    ``prange`` for numba to parallelise; joint prediction is likewise
+    dominated by scipy work.  Handing either to the numba axis wastes the
+    machine.  Measured on a 40-core box before this rule existed,
+    ``post_sample`` peaked at 1.93x on 8 cores and fell to 1.31x on 32.
+
+    The rule is asserted directly so it is covered on any machine, including
+    CI boxes with far fewer cores than the case being guarded.
+    """
+    from vecdgp.predict import _run_draws
+
+    def axis_for(nmcmc, cores, prefer_draws):
+        seen = []
+        _run_draws(lambda t, r, w: seen.append(w), nmcmc, cores,
+                   np.random.default_rng(0), prefer_draws=prefer_draws)
+        return len(set(seen))  # number of distinct workers actually used
+
+    # more draws than cores: both kinds split over draws
+    assert axis_for(20, 4, False) == 4
+    assert axis_for(20, 4, True) == 4
+
+    # fewer draws than cores: prange-friendly work goes to numba (1 worker),
+    # sequential work still splits over the draws it has
+    assert axis_for(20, 32, False) == 1, "lite prediction should use the numba axis"
+    assert axis_for(20, 32, True) == 20, "post_sample must still use the draws"
+
+    # degenerate cases stay serial
+    assert axis_for(1, 32, True) == 1
+    assert axis_for(20, 1, True) == 1
+
+
+def test_post_sample_requests_the_draw_axis():
+    """The flag must actually be passed, not just exist."""
+    import vecdgp.predict as P
+
+    seen = {}
+    orig = P._run_draws
+
+    def spy(body, nmcmc, cores, rng, prefer_draws=False):
+        seen[len(seen)] = prefer_draws
+        return orig(body, nmcmc, cores, rng, prefer_draws=prefer_draws)
+
+    rng = np.random.default_rng(0)
+    x = rng.random((60, 1))
+    y = np.sin(6 * x.ravel())
+    y = (y - y.mean()) / y.std()
+    fit = fit_two_layer(x, y, nmcmc=40, true_g=1e-6, m=8, verb=False,
+                        seed=1).trim(20)
+    xp = rng.random((15, 1))
+
+    P.predict_deep_vec.__globals__["_run_draws"] = spy
+    try:
+        seen.clear(); fit.predict(xp)
+        assert seen[0] is False, "lite prediction is prange-friendly"
+        seen.clear(); fit.predict(xp, lite=False, rng=np.random.default_rng(1))
+        assert seen[0] is True, "joint prediction is scipy-bound"
+        seen.clear(); fit.post_sample(xp, rng=np.random.default_rng(1))
+        assert seen[0] is True, "post_sample is sequential inside"
+    finally:
+        P.predict_deep_vec.__globals__["_run_draws"] = orig

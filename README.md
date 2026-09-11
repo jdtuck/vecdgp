@@ -1,5 +1,3 @@
-[![Pipeline Status](https://github.com/jdtuck/vecdgp/actions/workflows/Build.yml/badge.svg)](https://github.com/jdtuck/vecdgp/actions/workflows/Build.yml)
-
 # vecdgp — Vecchia-approximated deep Gaussian processes in Python
 
 A from-scratch Python implementation of
@@ -151,7 +149,7 @@ examples/
   demo_scaling.py  timing vs n, fits the exponent
   demo_post_sample.py  sample paths, and a functional a band cannot give you
 tests/
-  test_vecdgp.py   38 tests
+  test_vecdgp.py   40 tests
 bench/
   ubench.cpp       C++/OpenMP transliteration of u_entries
   run_bench.py     races numba against it
@@ -162,7 +160,7 @@ bench/
 
 ## Correctness
 
-Run `pytest tests -q` (38 tests, ~25 s). The core idea: **when `m = n − 1` the
+Run `pytest tests -q` (40 tests, ~30 s). The core idea: **when `m = n − 1` the
 Vecchia approximation is exact**, so every approximated quantity must
 reproduce the dense-GP calculation to machine precision.
 
@@ -231,11 +229,22 @@ found by profiling, gave **4.4x** on the kernel and **4.0x** end-to-end:
 `bench/opt_numba.py` isolates both effects. Results are unchanged to ~1e-8 and
 the test suite still passes, so this is pure overhead removal.
 
-Remaining headroom, in rough order of value: SIMD-vectorised transcendentals
-(numba picks these up automatically when Intel SVML is importable — untested
-here, as it would not load on this box); caching `U` across the MH steps that
-reject; and more cores, since the row loop is embarrassingly parallel and this
-box had only two.
+Remaining headroom: SIMD-vectorised transcendentals. Numba picks these up
+automatically via Intel SVML, which would plausibly be worth another 2-4x on
+`u_entries` and therefore on everything. The blocker is **llvmlite, not the
+SVML library** — LLVM has to be built with the SVML patch before it can emit
+vectorised calls, and installing `libsvml.so` / `intel-cmplr-lib-rt` does
+nothing on its own. One-line check:
+
+```bash
+python -c "import llvmlite.binding as b; print(b.targets.has_svml())"
+```
+
+`False` on the llvmlite here (0.49.0), which is why the gain is untested rather
+than dismissed. `python -m vecdgp.diagnose` now reports this distinction
+instead of a bare "SVML: False". After that: caching `U` across rejected MH
+steps, and more cores — the row loop is embarrassingly parallel and this box
+has only two.
 
 ## Troubleshooting
 
@@ -306,14 +315,27 @@ paths = fit.post_sample(xp, cores=16)
 `cores=None` (the default for prediction) uses everything available;
 `cores=1` forces serial. **Results do not depend on `cores`** — one RNG
 stream is spawned per MCMC draw rather than per worker, so every path is
-bit-identical however you set it (there are tests pinning this). Measured
-end-to-end on a 2-core box, n = 4000:
+bit-identical however you set it (there are tests pinning this).
 
-| | cores=1 | cores=2 | speedup |
+Measured on a **40-core** machine, n = 6000, d = 2, m = 25 (`bench/scaling_cores.py`):
+
+| cores | fit s/sweep | speedup | nmcmc = 10 000 |
 | --- | --- | --- | --- |
-| fit (s/sweep) | 0.634 | 0.321 | **1.97x** |
-| `predict()` | 0.69 s | 0.40 s | **1.70x** |
-| `post_sample()` | 1.83 s | 1.59 s | 1.15x |
+| 1 | 0.643 | 1.00x | 1.79 h |
+| 2 | 0.321 | 2.01x | 0.89 h |
+| 4 | 0.167 | 3.86x | 0.46 h |
+| 8 | 0.091 | 7.04x | 0.25 h |
+| 16 | 0.065 | 9.87x | 0.18 h |
+| 32 | 0.051 | **12.6x** | 0.14 h |
+| 40 | 0.055 | 11.6x | 0.15 h |
+
+**Scaling is near-linear to 8 cores, then flattens, and 40 is slower than 32.**
+Past ~8 threads each gets only a few hundred of the 6000 rows, and numba's
+fork/join cost across the ~20 parallel regions per sweep starts to dominate;
+at 40 it overtakes the gain. Use **16–32**, not everything you have, and
+re-measure at your own `n` — more rows push the sweet spot higher.
+
+The two halves parallelise by different mechanisms, which is worth knowing:
 
 The two halves parallelise by different mechanisms, which is worth knowing:
 
@@ -326,8 +348,15 @@ The two halves parallelise by different mechanisms, which is worth knowing:
   reach at all — numba threads alone take `post_sample` only 1.25x, and draw
   parallelism carries it the rest of the way to 1.67x.
 
-Measure it on your own hardware — this box only has two cores, so the ladder
-above is a floor, not a projection:
+A note on the prediction ladder: it uses only ~20 retained draws, and with
+fewer draws than cores there is nothing left to split. `post_sample` is
+sequential *inside* each draw (each test location conditions on the previous),
+so the draw axis is the only one that helps it — 0.3.3 makes it always take
+that axis rather than falling back to numba, which is why it used to peak at
+1.93x on 8 cores and sag to 1.31x on 32. With a realistic retained-draw count
+(hundreds) this never arises.
+
+Measure it on your own hardware:
 
 ```bash
 python bench/scaling_cores.py            # n=6000, d=2, m=25

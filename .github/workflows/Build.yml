@@ -33,6 +33,34 @@ jobs:
       shell: bash
       run: |
         pytest --doctest-modules --junitxml=junit/test-results.xml --cov=vecdgp --cov-report=xml --cov-report=html
+
+    - name: Environment and numerical self-check
+      # Logs the BLAS/LAPACK build, numba threading layer and thread count for
+      # this OS/Python, then re-runs the exactness identities and fails on any
+      # numerical warning. Worth having per-platform: numerical behaviour here
+      # depends on the LAPACK underneath numpy (MKL and OpenBLAS disagree on
+      # near-underflowing matrices), and speed depends on the thread count
+      # numba actually gets. Cheap, and turns "works on my machine" into
+      # something readable in the log.
+      shell: bash
+      run: python -m vecdgp.diagnose
+
+    - name: Test under numba's workqueue threading layer
+      # One job is enough -- the point is to exercise the *layer*, not the OS.
+      #
+      # workqueue is numba's fallback and is NOT threadsafe: entering a
+      # parallel=True kernel from several Python threads aborts the
+      # interpreter outright ("Concurrent access has been detected"). omp and
+      # tbb tolerate it. A stock macOS install typically lands on workqueue,
+      # which is how v0.3.0 passed on Linux (omp) and hard-crashed on macOS.
+      #
+      # Forcing the layer on a Linux runner catches that class of bug on every
+      # push, without waiting for a macOS job to fall over.
+      if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+      shell: bash
+      env:
+        NUMBA_THREADING_LAYER: workqueue
+      run: pytest -q
   
   build_sdist:
     needs: [build]

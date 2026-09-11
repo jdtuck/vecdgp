@@ -127,7 +127,7 @@ def _numba_threads(n):
         set_num_threads(prev)
 
 
-def _run_draws(body, nmcmc, cores, rng):
+def _run_draws(body, nmcmc, cores, rng, prefer_draws=False):
     """Apply ``body(t, rng, worker)`` for every draw, serially or across threads.
 
     One generator is spawned **per draw**, not per worker, so the random
@@ -136,15 +136,30 @@ def _run_draws(body, nmcmc, cores, rng):
     the negligible spawn cost, since a parallel run that quietly returned
     different numbers would be a nasty thing to debug.
 
+    There are two parallel axes and exactly one is used, never both (nesting
+    them aborts under numba's ``workqueue`` threading layer):
+
+    * **draws** -- a thread pool over MCMC draws, with serial numba kernels;
+    * **numba** -- a serial draw loop with ``prange`` at full width.
+
+    ``prefer_draws`` says the inner work is *not* prange-parallel, so the draw
+    axis is the only one that buys anything.  That is the case for
+    ``post_sample``, whose sampler is sequential over test locations by
+    construction, and for joint prediction, which is dominated by scipy
+    KD-tree and sparse-solve work numba cannot touch.  Without the flag, a
+    machine with more cores than draws hands the work to numba and the
+    parallelism silently collapses -- measured on a 40-core box, where
+    ``post_sample`` peaked at 1.93x on 8 cores and fell back to 1.31x on 32.
+
     ``body`` must be free of shared mutable state: callers hand each worker
     its own copies of anything the draw loop writes to.
     """
     rngs = _spawn(rng, nmcmc)
-    # With fewer draws than cores, splitting them would leave cores idle --
-    # each worker runs the *serial* kernels.  Better to keep the draw loop
-    # serial and let numba's prange use the full width instead.  Picking one
-    # axis or the other also means the two are never nested.
-    if cores <= 1 or nmcmc < 2 or nmcmc < cores:
+    # With fewer draws than cores, splitting them leaves cores idle (each
+    # worker runs the serial kernels), so prefer numba's prange -- unless the
+    # inner work has no prange to offer.
+    use_numba_axis = nmcmc < cores and not prefer_draws
+    if cores <= 1 or nmcmc < 2 or use_numba_axis:
         for t in range(nmcmc):
             body(t, rngs[t], 0)
         return
@@ -214,7 +229,8 @@ def predict_shallow_vec(obj, x_new, m=None, lite=True, order_new=None,
             sig_parts[w] = k["sigma"] if acc is None else acc + k["sigma"]
 
     s2_t_all = np.empty((obj.nmcmc, n_new)) if lite else None
-    _run_draws(body, obj.nmcmc, cores, rng)
+    _run_draws(body, obj.nmcmc, cores, rng,
+               prefer_draws=samples_only or not lite)
     if not samples_only:
         if lite:
             s2_sum = s2_t_all.sum(axis=0)
@@ -339,7 +355,8 @@ def predict_deep_vec(obj, x_new, m=None, lite=True, mean_map=True,
             acc = sig_parts.get(w)
             sig_parts[w] = k["sigma"] if acc is None else acc + k["sigma"]
 
-    _run_draws(body, obj.nmcmc, cores, rng)
+    _run_draws(body, obj.nmcmc, cores, rng,
+               prefer_draws=samples_only or not lite)
 
     if samples_only:
         return samples

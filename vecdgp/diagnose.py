@@ -39,8 +39,9 @@ def _versions():
         print(f"  numba   {numba.__version__}")
         from numba import config
 
-        print(f"  numba SVML (vectorised exp/log): {config.USING_SVML}")
-        print(f"  numba threads: {numba.get_num_threads()}")
+        print(f"  numba threads: {numba.get_num_threads()}  "
+              f"(of {config.NUMBA_NUM_THREADS} max)")
+        _svml_report(config)
     except Exception:
         print("  numba   NOT INSTALLED  -> pure-Python fallback, ~100x slower")
 
@@ -55,6 +56,46 @@ def _versions():
     except Exception:
         print("  BLAS/LAPACK: could not determine (older numpy)")
     print()
+
+
+def _svml_report(config):
+    """Report SVML status, and say *why* when it is off.
+
+    SVML gives LLVM vectorised ``exp``/``sqrt``.  Those dominate this
+    package's hot loop -- a 26x26 conditioning block is ~350 transcendentals
+    against ~5 900 flops of Cholesky -- so enabling it is the single largest
+    remaining speedup available.  A bare "False" is not actionable, because
+    there are two quite different reasons for it.
+    """
+    if config.USING_SVML:
+        print("  numba SVML (vectorised exp/log): ENABLED")
+        return
+    print("  numba SVML (vectorised exp/log): disabled", end="")
+    if config.DISABLE_INTEL_SVML:
+        print("  <- NUMBA_DISABLE_INTEL_SVML is set")
+        return
+    try:
+        import llvmlite.binding as llb
+
+        has = getattr(llb.targets, "has_svml", None)
+        if has is None:
+            print("  <- llvmlite too old to report SVML support")
+            return
+        if not has():
+            print()
+            print("      reason: this llvmlite was built WITHOUT LLVM's SVML")
+            print("      patch, so LLVM cannot emit vectorised calls no matter")
+            print("      what is installed. Installing libsvml/intel-cmplr-lib-rt")
+            print("      will NOT help. Check with:")
+            print("        python -c \"import llvmlite.binding as b; "
+                  "print(b.targets.has_svml())\"")
+            print("      A numba/llvmlite build that ships the patch is needed.")
+            return
+        print()
+        print("      llvmlite supports SVML but libsvml.so did not load;")
+        print("      check LD_LIBRARY_PATH / run ldconfig.")
+    except Exception as e:  # pragma: no cover
+        print(f"  <- could not determine ({e})")
 
 
 def _check(name, got, tol, fmt="{:.2e}"):
