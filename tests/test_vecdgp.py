@@ -34,7 +34,12 @@ from vecdgp import (
     rmse,
     score,
 )
-from vecdgp.vecchia import _chol_lower, forward_solve_ut, ut_mult
+from vecdgp.vecchia import (
+    _chol_lower,
+    find_ordered_nn_appended,
+    forward_solve_ut,
+    ut_mult,
+)
 
 V_CASES = [0.5, 1.5, 2.5, 999.0]
 
@@ -867,3 +872,62 @@ def test_nonfinite_parameters_raise_instead_of_returning_nan(booth_data):
         with pytest.raises(ValueError, match="finite|positive definite"):
             broken.sampler().sample(xp[:1], draw=0,
                                     rng=np.random.default_rng(0))
+
+
+def test_conditioning_sets_never_contain_the_row_itself():
+    """Column 0 is the row; columns 1.. are *strict* predecessors.
+
+    With duplicate points a KD-tree may return an equidistant predecessor
+    before the query point itself, and which one comes first is not defined --
+    it differs between platforms.  If that displaces the row out of column 0
+    it lands in a conditioning column, and ``_krig_samples`` then reads
+    ``work[row]``: a slot only written once that location has been drawn.
+    That read is uninitialised memory, which is zero on a fresh page (Linux,
+    silently wrong) and arbitrary on a recycled one (Windows, NaN).
+    """
+    # a grid whose test points include an exact copy of a training point
+    x = np.linspace(0, 1, 20)[:, None]
+    xp = np.linspace(0, 1, 100)[:, None][::10]
+    assert np.any(x[:, 0] == xp[0, 0]), "the fixture must contain a duplicate"
+
+    n_obs = x.shape[0]
+    pts = np.vstack([x, xp])
+    for m in (4, 8, 16):
+        NN, NN_len = find_ordered_nn_appended(pts, n_obs, m)
+        rows = np.arange(n_obs, pts.shape[0])
+        assert np.array_equal(NN[rows, 0], rows), "column 0 must be the row"
+        cond = NN[rows, 1:]
+        assert np.all(cond < rows[:, None]), "conditioning sets must precede"
+        assert np.all(cond >= 0), "appended rows must be fully populated"
+
+    # a conditioning set larger than the training set has to be clamped, not
+    # looped over forever: every appended row has only n_obs strict predecessors
+    NN, NN_len = find_ordered_nn_appended(pts, 5, 16)
+    rows = np.arange(5, pts.shape[0])
+    assert NN.shape[1] - 1 <= 5
+    assert np.all(NN[rows, 1:] < rows[:, None])
+
+    # and the same for the non-appended builder, on outright repeated points
+    rng = np.random.default_rng(0)
+    dup = np.repeat(rng.random((15, 2)), 3, axis=0)  # every point appears 3x
+    for m in (3, 7):
+        NN, NN_len = find_ordered_nn(dup, m)
+        for i in range(dup.shape[0]):
+            assert NN[i, 0] == i
+            row = NN[i, 1 : NN_len[i]]
+            assert np.all(row < i), f"row {i} conditions on {row}"
+
+
+def test_post_sample_is_finite_when_a_test_point_repeats_a_training_point():
+    """The end-to-end version of the invariant above."""
+    rng = np.random.default_rng(0)
+    x = rng.random((60, 1))
+    y = np.sin(6 * x.ravel()); y = (y - y.mean()) / y.std()
+    xp = np.vstack([x[:5], rng.random((10, 1))])  # first five are exact copies
+    for fn in (fit_one_layer, fit_two_layer):
+        fit = fn(x, y, nmcmc=120, true_g=1e-6, verb=False, seed=2, m=8).trim(60, 2)
+        paths = fit.post_sample(xp, nper=2, rng=np.random.default_rng(1), cores=1)
+        assert np.all(np.isfinite(paths))
+        # a duplicated location must reproduce the training value it copies,
+        # which is the check the uninitialised read was quietly failing
+        assert np.abs(paths[:, :5].mean(axis=0) - y[:5]).max() < 0.15

@@ -306,12 +306,21 @@ def find_ordered_nn(x, m):
 
             # `idx` is distance-sorted, and a *stable* argsort on the validity
             # mask floats the predecessors to the front preserving that order.
-            valid = idx <= pending[:, None]
-            enough = valid.sum(axis=1) >= m + 1
+            #
+            # The filter is *strict*: column 0 is the row itself and columns
+            # 1.. are conditioning points, which the brute-forced prefix above
+            # already assumes.  Admitting `idx == row` here would let the row
+            # land in a conditioning column whenever a tie put an equidistant
+            # predecessor first -- which happens whenever two points coincide,
+            # and which of the two the tree returns first is not defined.
+            valid = idx < pending[:, None]
+            enough = valid.sum(axis=1) >= m
             if enough.any():
+                rows = pending[enough]
                 order = np.argsort(~valid[enough], axis=1, kind="stable")
-                NN[pending[enough]] = np.take_along_axis(
-                    idx[enough], order[:, : m + 1], axis=1
+                NN[rows, 0] = rows
+                NN[rows, 1:] = np.take_along_axis(
+                    idx[enough], order[:, :m], axis=1
                 )
                 pending = pending[~enough]
             if pending.size:
@@ -345,7 +354,9 @@ def find_ordered_nn_appended(x, n_obs, m):
     """
     x = _as2d(x)
     n = x.shape[0]
-    m = int(min(m, max(n - 1, 0)))
+    # every appended row has at least ``n_obs`` strict predecessors, so this
+    # clamp is what makes a conditioning set of size ``m`` always available
+    m = int(min(m, max(n - 1, 0), max(n_obs, 0)))
     NN = np.full((n, m + 1), -1, dtype=np.int64)
     NN[:, 0] = np.arange(n)
     if n_obs >= n or m == 0:
@@ -362,13 +373,19 @@ def find_ordered_nn_appended(x, n_obs, m):
     while pending.size:
         _, idx = tree.query(x[pending], k=k, workers=-1)
         idx = np.atleast_2d(np.asarray(idx, dtype=np.int64))
-        valid = idx <= pending[:, None]
-        enough = valid.sum(axis=1) >= m + 1
+        # strict, for the reason given in find_ordered_nn: the sequential
+        # sampler reads work[NN[row, j]] for j >= 1 and has only written the
+        # slots of points it has already drawn.  A row admitted into its own
+        # conditioning set therefore reads a slot that was never written --
+        # uninitialised memory, which reads as zero on a fresh page and as
+        # whatever was there before on a recycled one.
+        valid = idx < pending[:, None]
+        enough = valid.sum(axis=1) >= m
         if enough.any():
+            rows = pending[enough]
             order = np.argsort(~valid[enough], axis=1, kind="stable")
-            NN[pending[enough]] = np.take_along_axis(
-                idx[enough], order[:, : m + 1], axis=1
-            )
+            NN[rows, 0] = rows
+            NN[rows, 1:] = np.take_along_axis(idx[enough], order[:, :m], axis=1)
             pending = pending[~enough]
         if pending.size:
             if k >= n:  # unreachable: every appended row has n_obs predecessors

@@ -130,7 +130,12 @@ def _krig_samples(x_ord, NN, NN_len, yo, z_norm, tau2, theta, g, v, sep, n_obs):
     n_new = n_total - n_obs
     nsamples = z_norm.shape[0]
     out = np.zeros((nsamples, n_new))
-    work = np.empty(n_total)
+    # zeros, not empty: slots n_obs.. are filled in as each location is drawn,
+    # so a conditioning set that named a not-yet-drawn point would otherwise
+    # read uninitialised memory -- silently zero on Linux, arbitrary on
+    # Windows.  find_ordered_nn_appended guarantees that cannot happen; this
+    # makes the consequence deterministic if that guarantee ever slips.
+    work = np.zeros(n_total)
     for k in range(n_obs):
         work[k] = yo[k]
 
