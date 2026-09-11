@@ -200,7 +200,8 @@ def predict_shallow_vec(obj, x_new, m=None, lite=True, order_new=None,
 
     ap = obj.x_approx
     ap.clean_pred()
-    ap.add_pred(x_new, m, lite=lite, order_new=order_new, rng=rng)
+    ap.add_pred(x_new, m, lite=lite, order_new=order_new, rng=rng,
+                pred_rows_only=samples_only)
 
     samples = np.empty((nper * obj.nmcmc, n_new)) if samples_only else None
     mu_t = np.empty((obj.nmcmc, n_new))
@@ -336,7 +337,8 @@ def predict_deep_vec(obj, x_new, m=None, lite=True, mean_map=True,
 
         w_ap.clean_pred()
         w_ap.set_coords(w_t)
-        w_ap.add_pred(w_new, m, lite=lite, order_new=order_new, rng=r)
+        w_ap.add_pred(w_new, m, lite=lite, order_new=order_new, rng=r,
+                      pred_rows_only=samples_only)
         if store_latent:
             w_new_store[t] = w_new
 

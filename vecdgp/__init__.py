@@ -40,6 +40,7 @@ from .fit import (
     fit_three_layer,
     fit_two_layer,
 )
+from .calibrate import PosteriorSampler
 from .kernels import EXP2, cov_matrix, cross_cov, sq_dist
 from .krig import krig_vec
 from .mcmc import logl_vec
@@ -64,6 +65,7 @@ __all__ = [
     "GPVec",
     "DGP2Vec",
     "DGP3Vec",
+    "PosteriorSampler",
     "krig_vec",
     "logl_vec",
     "create_approx",

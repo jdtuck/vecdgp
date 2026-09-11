@@ -121,6 +121,31 @@ class _BaseFit:
             raise ValueError("burn must be less than nmcmc")
         return _thin_index(self.nmcmc, burn, thin)
 
+    def _resolve_draws(self, draws):
+        """Normalise the ``draws`` argument to an index array, or None."""
+        if draws is None:
+            return None
+        if isinstance(draws, (int, np.integer)):
+            draws = [int(draws)]
+        idx = np.asarray(draws, dtype=np.int64).ravel()
+        if idx.size == 0:
+            raise ValueError("draws must select at least one iteration")
+        if idx.min() < -self.nmcmc or idx.max() >= self.nmcmc:
+            raise IndexError(
+                f"draws out of range for a fit with nmcmc={self.nmcmc}"
+            )
+        return idx % self.nmcmc
+
+    def select(self, draws):
+        """A view of this fit restricted to the given MCMC iterations.
+
+        ``trim`` drops burn-in and thins; this picks out arbitrary iterations,
+        which is what a calibration loop wants: one posterior draw per outer
+        step rather than all of them.
+        """
+        idx = self._resolve_draws(draws)
+        return self if idx is None else self._select(idx)
+
 
 @dataclass
 class GPVec(_BaseFit):
@@ -131,8 +156,7 @@ class GPVec(_BaseFit):
     tau2: np.ndarray = None
     x_approx: VecchiaApprox = None
 
-    def trim(self, burn, thin=1):
-        i = self._idx(burn, thin)
+    def _select(self, i):
         out = replace(self)
         out.nmcmc = len(i)
         out.theta = self.theta[i]
@@ -141,15 +165,18 @@ class GPVec(_BaseFit):
         out.g = self.g if np.ndim(self.g) == 0 else self.g[i]
         return out
 
+    def trim(self, burn, thin=1):
+        return self._select(self._idx(burn, thin))
+
     def predict(self, x_new, m=None, lite=True, order_new=None,
-                return_all=False, rng=None, cores=None):
-        return predict_shallow_vec(self, x_new, m=m, lite=lite,
+                return_all=False, rng=None, cores=None, draws=None):
+        return predict_shallow_vec(self.select(draws), x_new, m=m, lite=lite,
                                    order_new=order_new,
                                    return_all=return_all, rng=rng,
                                    cores=resolve_cores(cores))
 
     def post_sample(self, x_new, nper=1, m=None, order_new=None, rng=None,
-                    cores=None):
+                    cores=None, draws=None):
         """Draw joint posterior sample paths at ``x_new``.
 
         Unlike ``predict``, which returns summarised moments, this returns
@@ -180,10 +207,27 @@ class GPVec(_BaseFit):
         -------
         ndarray, shape ``(nper * nmcmc, len(x_new))``
         """
-        return predict_shallow_vec(self, x_new, m=m, order_new=order_new,
-                                   rng=rng, samples_only=True, nper=nper,
+        return predict_shallow_vec(self.select(draws), x_new, m=m,
+                                   order_new=order_new, rng=rng,
+                                   samples_only=True, nper=nper,
                                    cores=resolve_cores(cores))
 
+
+
+    def sampler(self, m=None, max_cached=None):
+        """A cached sampler for repeated single-location draws.
+
+        Built for calibration MCMC: an outer loop that evaluates the emulator
+        once per iteration at one proposed parameter. ``post_sample`` spends
+        almost all of its time on per-call setup over the training set, none of
+        which depends on the evaluation point; this hoists it out and memoises
+        it per posterior draw.
+
+        See :class:`vecdgp.calibrate.PosteriorSampler`.
+        """
+        from .calibrate import PosteriorSampler
+
+        return PosteriorSampler(self, m=m, max_cached=max_cached)
 
 @dataclass
 class DGP2Vec(_BaseFit):
@@ -197,8 +241,7 @@ class DGP2Vec(_BaseFit):
     x_approx: VecchiaApprox = None
     w_approx: VecchiaApprox = None
 
-    def trim(self, burn, thin=1):
-        i = self._idx(burn, thin)
+    def _select(self, i):
         out = replace(self)
         out.nmcmc = len(i)
         out.theta_y = self.theta_y[i]
@@ -209,16 +252,19 @@ class DGP2Vec(_BaseFit):
         out.g = self.g if np.ndim(self.g) == 0 else self.g[i]
         return out
 
+    def trim(self, burn, thin=1):
+        return self._select(self._idx(burn, thin))
+
     def predict(self, x_new, m=None, lite=True, mean_map=True,
                 store_latent=False, order_new=None, return_all=False, rng=None,
-                cores=None):
-        return predict_deep_vec(self, x_new, m=m, lite=lite, mean_map=mean_map,
-                                store_latent=store_latent, order_new=order_new,
-                                return_all=return_all, layers=2, rng=rng,
-                                cores=resolve_cores(cores))
+                cores=None, draws=None):
+        return predict_deep_vec(self.select(draws), x_new, m=m, lite=lite,
+                                mean_map=mean_map, store_latent=store_latent,
+                                order_new=order_new, return_all=return_all,
+                                layers=2, rng=rng, cores=resolve_cores(cores))
 
     def post_sample(self, x_new, nper=1, m=None, mean_map=True,
-                    order_new=None, rng=None, cores=None):
+                    order_new=None, rng=None, cores=None, draws=None):
         """Draw joint posterior sample paths at ``x_new``.
 
         See :meth:`GPVec.post_sample`.  ``mean_map=False`` additionally
@@ -230,11 +276,27 @@ class DGP2Vec(_BaseFit):
         -------
         ndarray, shape ``(nper * nmcmc, len(x_new))``
         """
-        return predict_deep_vec(self, x_new, m=m, mean_map=mean_map,
-                                order_new=order_new, rng=rng, layers=2,
-                                samples_only=True, nper=nper,
-                                cores=resolve_cores(cores))
+        return predict_deep_vec(self.select(draws), x_new, m=m,
+                                mean_map=mean_map, order_new=order_new,
+                                rng=rng, layers=2, samples_only=True,
+                                nper=nper, cores=resolve_cores(cores))
 
+
+
+    def sampler(self, m=None, max_cached=None):
+        """A cached sampler for repeated single-location draws.
+
+        Built for calibration MCMC: an outer loop that evaluates the emulator
+        once per iteration at one proposed parameter. ``post_sample`` spends
+        almost all of its time on per-call setup over the training set, none of
+        which depends on the evaluation point; this hoists it out and memoises
+        it per posterior draw.
+
+        See :class:`vecdgp.calibrate.PosteriorSampler`.
+        """
+        from .calibrate import PosteriorSampler
+
+        return PosteriorSampler(self, m=m, max_cached=max_cached)
 
 @dataclass
 class DGP3Vec(_BaseFit):
@@ -251,8 +313,7 @@ class DGP3Vec(_BaseFit):
     w_approx: VecchiaApprox = None
     z_approx: VecchiaApprox = None
 
-    def trim(self, burn, thin=1):
-        i = self._idx(burn, thin)
+    def _select(self, i):
         out = replace(self)
         out.nmcmc = len(i)
         out.theta_y = self.theta_y[i]
@@ -265,16 +326,19 @@ class DGP3Vec(_BaseFit):
         out.g = self.g if np.ndim(self.g) == 0 else self.g[i]
         return out
 
+    def trim(self, burn, thin=1):
+        return self._select(self._idx(burn, thin))
+
     def predict(self, x_new, m=None, lite=True, mean_map=True,
                 store_latent=False, order_new=None, return_all=False, rng=None,
-                cores=None):
-        return predict_deep_vec(self, x_new, m=m, lite=lite, mean_map=mean_map,
-                                store_latent=store_latent, order_new=order_new,
-                                return_all=return_all, layers=3, rng=rng,
-                                cores=resolve_cores(cores))
+                cores=None, draws=None):
+        return predict_deep_vec(self.select(draws), x_new, m=m, lite=lite,
+                                mean_map=mean_map, store_latent=store_latent,
+                                order_new=order_new, return_all=return_all,
+                                layers=3, rng=rng, cores=resolve_cores(cores))
 
     def post_sample(self, x_new, nper=1, m=None, mean_map=True,
-                    order_new=None, rng=None, cores=None):
+                    order_new=None, rng=None, cores=None, draws=None):
         """Draw joint posterior sample paths at ``x_new``.
 
         See :meth:`GPVec.post_sample`.  ``mean_map=False`` additionally
@@ -286,11 +350,27 @@ class DGP3Vec(_BaseFit):
         -------
         ndarray, shape ``(nper * nmcmc, len(x_new))``
         """
-        return predict_deep_vec(self, x_new, m=m, mean_map=mean_map,
-                                order_new=order_new, rng=rng, layers=3,
-                                samples_only=True, nper=nper,
-                                cores=resolve_cores(cores))
+        return predict_deep_vec(self.select(draws), x_new, m=m,
+                                mean_map=mean_map, order_new=order_new,
+                                rng=rng, layers=3, samples_only=True,
+                                nper=nper, cores=resolve_cores(cores))
 
+
+
+    def sampler(self, m=None, max_cached=None):
+        """A cached sampler for repeated single-location draws.
+
+        Built for calibration MCMC: an outer loop that evaluates the emulator
+        once per iteration at one proposed parameter. ``post_sample`` spends
+        almost all of its time on per-call setup over the training set, none of
+        which depends on the evaluation point; this hoists it out and memoises
+        it per posterior draw.
+
+        See :class:`vecdgp.calibrate.PosteriorSampler`.
+        """
+        from .calibrate import PosteriorSampler
+
+        return PosteriorSampler(self, m=m, max_cached=max_cached)
 
 # ---------------------------------------------------------------------------
 # fit functions

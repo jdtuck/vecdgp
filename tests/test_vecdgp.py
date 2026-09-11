@@ -654,3 +654,184 @@ def test_post_sample_requests_the_draw_axis():
         assert seen[0] is True, "post_sample is sequential inside"
     finally:
         P.predict_deep_vec.__globals__["_run_draws"] = orig
+
+
+# ---------------------------------------------------------------------------
+# selecting individual posterior draws (calibration-style use)
+# ---------------------------------------------------------------------------
+def test_draws_selects_individual_posterior_iterations(booth_data):
+    """`draws` must pick out iterations without changing what they produce.
+
+    A calibration MCMC needs one emulator sample per outer step, not one per
+    retained draw.  Computing all of them and keeping one is pure waste --
+    measured at 232 ms vs 3.7 ms for a single location at n = 6000.
+    """
+    x, y, xp, _ = booth_data
+    fit = fit_two_layer(x, y, nmcmc=400, true_g=1e-6, verb=False, seed=1,
+                        m=10).trim(200, 2)
+    assert fit.nmcmc == 100
+    xq = xp[:5]
+
+    assert fit.post_sample(xq, draws=3).shape == (1, 5)
+    assert fit.post_sample(xq, draws=[3, 8, 20]).shape == (3, 5)
+    assert fit.post_sample(xq, draws=-1).shape == (1, 5)
+    assert fit.post_sample(xq, nper=4, draws=3).shape == (4, 5)
+    assert fit.post_sample(xq).shape == (100, 5)  # default unchanged
+
+    with pytest.raises(IndexError):
+        fit.post_sample(xq, draws=100)
+    with pytest.raises(IndexError):
+        fit.post_sample(xq, draws=-101)
+    with pytest.raises(ValueError):
+        fit.post_sample(xq, draws=[])
+
+
+def test_select_is_consistent_with_trim(booth_data):
+    """`select` and `trim` must agree where they overlap."""
+    x, y, _, _ = booth_data
+    fit = fit_two_layer(x, y, nmcmc=200, true_g=1e-6, verb=False, seed=2, m=8)
+    idx = _thin_idx = np.arange(101, 201)[np.arange(101, 201) % 2 == 0] - 1
+    a = fit.trim(100, 2)
+    b = fit.select(idx)
+    assert a.nmcmc == b.nmcmc
+    assert np.array_equal(a.theta_y, b.theta_y)
+    assert np.array_equal(a.w, b.w)
+    assert np.array_equal(a.tau2_y, b.tau2_y)
+
+
+def test_selected_draw_uses_that_draws_parameters(booth_data):
+    """Picking draw t must actually use iteration t, not some other one."""
+    x, y, xp, _ = booth_data
+    fit = fit_two_layer(x, y, nmcmc=400, true_g=1e-6, verb=False, seed=3,
+                        m=10).trim(200, 2)
+    for t in (0, 11, 99):
+        one = fit.select(t)
+        assert one.nmcmc == 1
+        assert one.theta_y[0] == fit.theta_y[t]
+        assert np.array_equal(one.w[0], fit.w[t])
+        assert one.tau2_y[0] == fit.tau2_y[t]
+
+
+def test_appended_only_conditioning_sets_match_the_full_computation():
+    """The post_sample shortcut must be exact, not merely close.
+
+    Only the appended rows are built (the sampler reads nothing else), so
+    those rows must equal what the full ordered-NN search produces.
+    """
+    from vecdgp.vecchia import find_ordered_nn, find_ordered_nn_appended
+
+    rng = np.random.default_rng(0)
+    for n_obs, n_new, m in [(800, 120, 25), (300, 300, 15), (500, 1, 30)]:
+        x = rng.random((n_obs + n_new, 2))
+        full, full_len = find_ordered_nn(x, m)
+        app, app_len = find_ordered_nn_appended(x, n_obs, m)
+        rows = slice(n_obs, n_obs + n_new)
+        assert np.array_equal(full[rows], app[rows])
+        assert np.array_equal(full_len[rows], app_len[rows])
+
+
+def test_partial_conditioning_sets_cannot_be_used_to_build_U():
+    """Guard against silent wrongness if the shortcut leaks into the U path."""
+    from vecdgp.vecchia import create_U_sparse, create_U_values
+
+    rng = np.random.default_rng(0)
+    ap = create_approx(rng.random((200, 2)), m=10, rng=rng)
+    ap.add_pred(rng.random((20, 2)), m=20, lite=False, rng=rng,
+                pred_rows_only=True)
+    for fn in (create_U_values, create_U_sparse):
+        with pytest.raises(ValueError, match="predictive rows only"):
+            fn(ap, 1.0, 0.3, 1e-6, 2.5)
+
+
+# ---------------------------------------------------------------------------
+# cached sampler for calibration MCMC
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("fit_fn", [fit_one_layer, fit_two_layer, fit_three_layer])
+def test_sampler_moments_are_identical_to_predict(booth_data, fit_fn):
+    """The fast path must be the same calculation, not an approximation of it.
+
+    `sampler` skips post_sample's per-call setup over the training set.  That
+    is only legitimate if the conditioning sets and conditional moments come
+    out the same, so this demands exact equality with predict(draws=t), not
+    closeness.
+    """
+    x, y, xp, _ = booth_data
+    fit = fit_fn(x, y, nmcmc=300, true_g=1e-6, verb=False, seed=1,
+                 m=8).trim(150, 2)
+    emu = fit.sampler()
+    for t in (0, 7, fit.nmcmc - 1):
+        mu, sd = emu.mean_sd(xp[:9], draw=t)
+        p = fit.predict(xp[:9], draws=t, cores=1)
+        assert np.array_equal(mu, p.mean)
+        assert np.allclose(sd, np.sqrt(p.s2), rtol=0, atol=0)
+
+
+def test_sampler_draws_have_the_right_moments(booth_data):
+    x, y, xp, _ = booth_data
+    fit = fit_two_layer(x, y, nmcmc=300, true_g=1e-6, verb=False, seed=2,
+                        m=8).trim(150, 2)
+    emu = fit.sampler()
+    t, q = 5, xp[:1]
+    mu, sd = emu.mean_sd(q, draw=t)
+    s = emu.sample(q, draw=t, rng=np.random.default_rng(3), nper=60000)
+    assert s.shape == (60000, 1)
+    se = sd[0] / np.sqrt(60000)
+    assert abs(s.mean() - mu[0]) < 5 * se
+    assert abs(s.std() - sd[0]) < 0.05 * sd[0]
+
+
+def test_sampler_matches_post_sample_distribution(booth_data):
+    """Against the reference path, at the same posterior draw."""
+    x, y, xp, _ = booth_data
+    fit = fit_two_layer(x, y, nmcmc=300, true_g=1e-6, verb=False, seed=3,
+                        m=8).trim(150, 2)
+    emu = fit.sampler()
+    t, q = 11, xp[:1]
+    a = emu.sample(q, draw=t, rng=np.random.default_rng(4), nper=40000)
+    b = fit.post_sample(q, draws=t, nper=40000, rng=np.random.default_rng(5),
+                        cores=1)
+    assert abs(a.mean() - b.mean()) < 0.05 * b.std()
+    assert abs(a.std() - b.std()) < 0.05 * b.std()
+
+
+def test_sampler_handles_several_locations_at_once(booth_data):
+    """Multiple points condition on each other, as the sequential path does."""
+    x, y, xp, _ = booth_data
+    fit = fit_two_layer(x, y, nmcmc=200, true_g=1e-6, verb=False, seed=4,
+                        m=8).trim(100, 2)
+    emu = fit.sampler()
+    q = xp[:6]
+    s = emu.sample(q, draw=2, rng=np.random.default_rng(6), nper=20000)
+    assert s.shape == (20000, 6)
+    mu, sd = emu.mean_sd(q, draw=2)
+    # marginals still match; the joint adds the cross-conditioning
+    assert np.abs(s.mean(axis=0) - mu).max() < 0.1 * sd.mean()
+    # neighbouring locations must come out correlated, not independent
+    c = np.corrcoef(s, rowvar=False)
+    assert np.abs(c[np.triu_indices(6, 1)]).max() > 0.2
+
+
+def test_sampler_cache_is_lazy_and_bounded(booth_data):
+    x, y, xp, _ = booth_data
+    fit = fit_two_layer(x, y, nmcmc=200, true_g=1e-6, verb=False, seed=5,
+                        m=8).trim(100, 2)
+    emu = fit.sampler(max_cached=3)
+    assert len(emu._cache) == 0, "state must not be built until a draw is used"
+    for t in range(6):
+        emu.sample(xp[:1], draw=t, rng=np.random.default_rng(t))
+    assert len(emu._cache) <= 3, "max_cached must bound the cache"
+    # evicted draws still work, and still give the same moments
+    mu, _ = emu.mean_sd(xp[:1], draw=0)
+    assert np.array_equal(mu, fit.predict(xp[:1], draws=0, cores=1).mean)
+
+
+def test_sampler_draw_index_wraps_and_validates(booth_data):
+    x, y, xp, _ = booth_data
+    fit = fit_two_layer(x, y, nmcmc=200, true_g=1e-6, verb=False, seed=6,
+                        m=8).trim(100, 2)
+    emu = fit.sampler()
+    a, _ = emu.mean_sd(xp[:1], draw=-1)
+    b, _ = emu.mean_sd(xp[:1], draw=emu.nmcmc - 1)
+    assert np.array_equal(a, b)
+    with pytest.raises(ValueError):
+        emu.sample(np.zeros((1, 5)), draw=0)  # wrong input dimension

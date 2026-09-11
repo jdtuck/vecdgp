@@ -67,6 +67,7 @@ __all__ = [
     "EPS",
     "VecchiaApprox",
     "find_ordered_nn",
+    "find_ordered_nn_appended",
     "create_approx",
     "u_entries",
     "u_entries_serial",
@@ -303,6 +304,61 @@ def find_ordered_nn(x, m):
     return NN, _nn_len(NN)
 
 
+def find_ordered_nn_appended(x, n_obs, m):
+    """Ordered NN sets for the **appended** rows only (``n_obs`` onwards).
+
+    ``post_sample`` draws sequentially at the predictive locations and reads
+    only their rows of ``NN`` -- the training rows are computed and thrown
+    away.  At n = 6000 with 500 test points that is 92% wasted work, repeated
+    at every MCMC draw, and it was the single largest cost in ``post_sample``.
+
+    Only the appended rows are filled; earlier rows are left as ``[i, -1...]``
+    placeholders.  The result is therefore **not** a complete Vecchia
+    approximation -- :func:`create_U_values` and :func:`create_U_sparse` refuse
+    to touch it (see ``VecchiaApprox.pred_rows_only``), because building ``U``
+    from placeholder rows would silently produce wrong numbers rather than an
+    error.
+
+    Exactness for the rows it does fill is unchanged: each is still the true
+    set of ``m`` nearest predecessors.  Predecessors here are every training
+    point plus the earlier appended ones, so at most ``n_new`` of any
+    neighbour list can fail the index filter -- a small fraction when the test
+    set is smaller than the training set, which keeps ``k`` modest.
+    """
+    x = _as2d(x)
+    n = x.shape[0]
+    m = int(min(m, max(n - 1, 0)))
+    NN = np.full((n, m + 1), -1, dtype=np.int64)
+    NN[:, 0] = np.arange(n)
+    if n_obs >= n or m == 0:
+        return NN, _nn_len(NN)
+
+    tree = _build_tree(x)
+    pending = np.arange(n_obs, n)
+    k = int(min(n, 2 * (m + 1)))
+    # NN_len is known by construction here, so skip the (n, m+1) scan that
+    # _nn_len would do -- at one test location that scan was a third of the
+    # per-draw cost, all of it spent on rows nothing reads.
+    NN_len = np.ones(n, dtype=np.int64)
+    NN_len[n_obs:] = m + 1
+    while pending.size:
+        _, idx = tree.query(x[pending], k=k, workers=-1)
+        idx = np.atleast_2d(np.asarray(idx, dtype=np.int64))
+        valid = idx <= pending[:, None]
+        enough = valid.sum(axis=1) >= m + 1
+        if enough.any():
+            order = np.argsort(~valid[enough], axis=1, kind="stable")
+            NN[pending[enough]] = np.take_along_axis(
+                idx[enough], order[:, : m + 1], axis=1
+            )
+            pending = pending[~enough]
+        if pending.size:
+            if k >= n:  # unreachable: every appended row has n_obs predecessors
+                raise RuntimeError("failed to build conditioning sets")
+            k = int(min(n, 2 * k))
+    return NN, NN_len
+
+
 def _nn_len(NN):
     return (NN >= 0).sum(axis=1).astype(np.int64)
 
@@ -355,6 +411,7 @@ class VecchiaApprox:
     rev_ord_new: Optional[np.ndarray] = None  # lite = False
     observed: Optional[np.ndarray] = None  # lite = False
     n_obs: int = 0
+    pred_rows_only: bool = False  # NN holds only the appended rows
 
     # -- construction -------------------------------------------------------
     def copy(self):
@@ -385,12 +442,14 @@ class VecchiaApprox:
             self.observed = None
             self.order_new = None
             self.rev_ord_new = None
+            self.pred_rows_only = False
         self.m_new = None
         self.x_new = None
         self.NN_new = None
         return self
 
-    def add_pred(self, x_new, m, lite=True, order_new=None, rng=None):
+    def add_pred(self, x_new, m, lite=True, order_new=None, rng=None,
+                 pred_rows_only=False):
         """Incorporate predictive locations.
 
         ``lite=True`` stores, for each test point, its ``m`` nearest training
@@ -420,7 +479,15 @@ class VecchiaApprox:
             self.x_ord = np.ascontiguousarray(
                 np.vstack([self.x_ord, x_new[order_new]])
             )
-            self.NN, self.NN_len = find_ordered_nn(self.x_ord, m)
+            # Sequential sampling reads only the appended rows, so computing
+            # the training ones is pure waste -- see find_ordered_nn_appended.
+            self.pred_rows_only = bool(pred_rows_only)
+            if self.pred_rows_only:
+                self.NN, self.NN_len = find_ordered_nn_appended(
+                    self.x_ord, n_obs, m
+                )
+            else:
+                self.NN, self.NN_len = find_ordered_nn(self.x_ord, m)
         return self
 
 
@@ -455,6 +522,11 @@ def create_U_values(approx, tau2=1.0, theta=0.1, g=0.0, v=2.5, sep=False):
     Dispatches to the serial kernel when already running inside vecdgp's
     thread pool, so a ``parallel=True`` region is never entered concurrently.
     """
+    if getattr(approx, "pred_rows_only", False):
+        raise ValueError(
+            "this approx holds conditioning sets for the predictive rows only "
+            "(built for sequential sampling); U cannot be formed from it"
+        )
     th = _theta_vec(theta, approx.x_ord.shape[1], sep)
     kernel = u_entries_serial if in_worker() else u_entries
     return kernel(
