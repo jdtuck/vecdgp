@@ -1,3 +1,5 @@
+[![Pipeline Status](https://github.com/jdtuck/vecdgp/actions/workflows/Build.yml/badge.svg)](https://github.com/jdtuck/vecdgp/actions/workflows/Build.yml)
+
 # vecdgp — Vecchia-approximated deep Gaussian processes in Python
 
 A from-scratch Python implementation of
